@@ -5,7 +5,7 @@
 export ZSH=$HOME/.oh-my-zsh
 export ANDROID_SDK=/Users/kgoggin/Library/Android/sdk
 export PATH=/Users/kgoggin/Library/Android/sdk/platform-tools:$PATH
-export PATH="/usr/local/opt/ruby@2.4/bin:$PATH"
+export PATH="/usr/local/opt/ruby@2.7/bin:$PATH"
 
 # Set name of the theme to load --- if set to "random", it will
 # load a random theme each time oh-my-zsh is loaded, in which case,
