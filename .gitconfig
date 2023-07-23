@@ -1,13 +1,13 @@
 [user]
 	name = Kyle Goggin
 	email = kyle@kylegoggin.com
-[core]
-	excludesfile = /Users/kgoggin/.gitignore_global
 [alias]
 	undo = reset --soft HEAD^
-	cleanup = !git remote prune origin && git branch --merged | egrep -v '(^\\*|master|develop)' | xargs git branch -d
+	cleanup = !git remote prune origin && git branch --merged | egrep -v '(^\\*|main|develop)' | xargs git branch -d
 [filter "lfs"]
 	required = true
 	clean = git-lfs clean -- %f
 	smudge = git-lfs smudge -- %f
 	process = git-lfs filter-process
+[init]
+	defaultBranch = main

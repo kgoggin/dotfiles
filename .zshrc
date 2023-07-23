@@ -2,10 +2,7 @@
 # export PATH=$HOME/bin:/usr/local/bin:$PATH
 
 # Path to your oh-my-zsh installation.
-export ZSH=$HOME/.oh-my-zsh
-export ANDROID_SDK=/Users/kgoggin/Library/Android/sdk
-export PATH=/Users/kgoggin/Library/Android/sdk/platform-tools:$PATH
-export PATH="/usr/local/opt/ruby@2.7/bin:$PATH"
+export ZSH="/Users/kyle.goggin/.oh-my-zsh"
 
 # Set name of the theme to load --- if set to "random", it will
 # load a random theme each time oh-my-zsh is loaded, in which case,
@@ -101,6 +98,7 @@ source $ZSH/oh-my-zsh.sh
 #
 # Example aliases
 alias zshconfig="code ~/.zshrc"
+alias -g nodenv="fnm"
 
 export PATH=/Users/kgoggin/.fnm:$PATH
 eval "`fnm env`"
@@ -118,5 +116,25 @@ eval "`fnm env`"
       add-zsh-hook chpwd _fnm_autoload_hook \
         && _fnm_autoload_hook
 
+if type -p rbenv >/dev/null; then
+  if [ -d /usr/local/var/rbenv ]; then
+    export RBENV_ROOT=/usr/local/var/rbenv
+  fi
+  eval "$(rbenv init -)"
+fi
+
 autoload -U promptinit; promptinit
 prompt pure
+
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+
+export PATH="$HOME/.jenv/bin:$PATH"
+eval "$(jenv init -)"
+# BEGIN ZDI
+export DOCKER_FOR_MAC_ENABLED=true
+source /Users/kyle.goggin/Code/zendesk/zdi/dockmaster/zdi.sh
+# END ZDI
+
+[[ "$TERM_PROGRAM" == "vscode" ]] && . "$(code --locate-shell-integration-path zsh)"
