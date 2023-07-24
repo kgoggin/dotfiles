@@ -123,6 +123,8 @@ if type -p rbenv >/dev/null; then
   eval "$(rbenv init -)"
 fi
 
+fpath+=("$(brew --prefix)/share/zsh/site-functions")
+
 autoload -U promptinit; promptinit
 prompt pure
 
@@ -130,11 +132,18 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
 
-export PATH="$HOME/.jenv/bin:$PATH"
-eval "$(jenv init -)"
+# export PATH="$HOME/.jenv/bin:$PATH"
+# eval "$(jenv init -)"
+
+[[ "$TERM_PROGRAM" == "vscode" ]] && . "$(code --locate-shell-integration-path zsh)"
+
+# fnm
+export PATH="/Users/kyle.goggin/Library/Application Support/fnm:$PATH"
+eval "`fnm env`"
+
+# source /opt/homebrew/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
 # BEGIN ZDI
 export DOCKER_FOR_MAC_ENABLED=true
 source /Users/kyle.goggin/Code/zendesk/zdi/dockmaster/zdi.sh
 # END ZDI
-
-[[ "$TERM_PROGRAM" == "vscode" ]] && . "$(code --locate-shell-integration-path zsh)"
+eval "$(direnv hook zsh)"
