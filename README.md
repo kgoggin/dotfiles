@@ -25,13 +25,20 @@ PR's merge commit is an ancestor of the current `HEAD`. Branches with newer
 local commits, PRs merged into another base, and PRs from forks are skipped.
 Without `gh` or when the lookup fails, cleanup uses Git ancestry alone.
 
-If remote ref pruning fails, cleanup reports the failure and continues with
+On a case-insensitive filesystem, remote refs differing only by case (such
+as `Rishabh/...` and `rishabh/...`) can collide while Git locks them for
+pruning. If normal pruning fails, cleanup checks the server and removes
+case-colliding stale remote refs in separate transactions, then retries
+normal pruning. It preserves the entire group if any case variant exists
+on the server, verifies each ref's expected commit before deletion, and
+never removes existing lock files. This repair supports the standard
+`origin` fetch mapping; custom mappings and negative refspecs are left to Git.
+Dry runs never perform this repair.
+
+If pruning still fails, cleanup reports the failure and continues with
 local branch and worktree cleanup. Its exit status remains nonzero to signal
 that pruning was incomplete. Git may print `[pruned]` lines even after a
-pruning error; look for the error earlier in the output. On a case-insensitive
-filesystem, remote refs differing only by case (such as `Rishabh/...` and
-`rishabh/...`) can collide while Git locks them for pruning. This does not
-prevent checking merged branches or prompting for linked worktrees.
+pruning error; look for the error earlier in the output.
 
 Preview candidates without removing worktrees, branches, or refs:
 

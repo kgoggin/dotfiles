@@ -153,6 +153,55 @@ class CleanupTest(unittest.TestCase):
         self.assertTrue(path.exists())
         self.assertTrue(self.has_branch("topic"))
 
+    def case_colliding_refs(self, names=("Rishabh/topic", "rishabh/topic")):
+        oid = self.git("rev-parse", "HEAD").stdout.strip()
+        # Packed refs can represent names that cannot coexist as loose files
+        # on a case-insensitive filesystem, reproducing the real repository.
+        packed = self.repo / ".git" / "packed-refs"
+        packed.write_text("# pack-refs with: peeled fully-peeled sorted\n" +
+                          "".join(f"{oid} refs/remotes/origin/{name}\n"
+                                  for name in sorted(names)))
+        return ["refs/remotes/origin/" + name for name in names]
+
+    def has_ref(self, ref):
+        return self.git("show-ref", "--verify", "--quiet", ref,
+                        check=False).returncode == 0
+
+    def test_case_colliding_stale_refs_are_pruned(self):
+        refs = self.case_colliding_refs()
+        result = self.cleanup()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for ref in refs:
+            self.assertFalse(self.has_ref(ref))
+        self.assertTrue(self.has_ref("refs/remotes/origin/main"))
+        probe = self.root / "case-probe"
+        probe.touch()
+        if (self.root / "CASE-PROBE").exists():
+            self.assertIn("Pruning stale refs with case-colliding names", result.stdout)
+
+    def test_dry_run_preserves_case_colliding_refs(self):
+        refs = self.case_colliding_refs()
+        result = self.git("cleanup-test", "--dry-run", input="", check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for ref in refs:
+            self.assertTrue(self.has_ref(ref))
+
+    def test_live_case_variant_is_preserved(self):
+        self.git("push", "origin", "main:refs/heads/RISHABH/topic")
+        refs = self.case_colliding_refs(("RISHABH/topic", "Rishabh/topic", "rishabh/topic"))
+        self.cleanup()
+        self.assertTrue(self.has_ref(refs[0]))
+
+    def test_case_collision_repair_respects_existing_locks(self):
+        refs = self.case_colliding_refs()
+        lock = self.repo / ".git/refs/remotes/origin/Rishabh/topic.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("Existing lock")
+        result = self.cleanup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(lock.read_text(), "Existing lock")
+        self.assertTrue(self.has_ref(refs[0]))
+
     def test_yes_removes_worktree_then_branch(self):
         path = self.worktree(name='linked "worktree"\nwith newline')
         result = self.cleanup("y\n")

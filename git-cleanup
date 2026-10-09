@@ -2,6 +2,47 @@
 # Delete merged branches, asking before removing their linked worktrees.
 set -u
 
+# Git locks every stale ref in one transaction when pruning. Case-only names
+# can share a lock filename on macOS; separate transactions avoid that clash.
+prune_case_collisions() {
+    local fetch_specs server_refs tracking_refs collisions old_oid ref
+    fetch_specs=$(git config --get-all remote.origin.fetch) || return 1
+    case "$fetch_specs" in
+        '+refs/heads/*:refs/remotes/origin/*'|'refs/heads/*:refs/remotes/origin/*') ;;
+        *) return 1 ;; # Leave custom mappings and negative refspecs to Git.
+    esac
+    server_refs=$(git ls-remote --heads origin) || return 1
+    tracking_refs=$(git for-each-ref --format='%(objectname) %(refname) %(symref)' \
+        refs/remotes/origin/) || return 1
+    collisions=$(printf '%s\n%s\n' "$server_refs" "$tracking_refs" | LC_ALL=C awk '
+        $2 ~ /^refs\/heads\// {
+            # Preserve the entire case-folded group if any variant is live.
+            live[tolower("refs/remotes/origin/" substr($2, 12))] = 1
+            next
+        }
+        $2 ~ /^refs\/remotes\/origin\// {
+            key = tolower($2)
+            count[key]++
+            refs[++n] = $2
+            oids[n] = $1
+            groups[n] = key
+            if (NF > 2) live[key] = 1 # Never delete symbolic refs.
+        }
+        END {
+            for (i = 1; i <= n; i++)
+                if (count[groups[i]] > 1 && !live[groups[i]])
+                    print oids[i], refs[i]
+        }
+    ') || return 1
+    [[ -n "$collisions" ]] || return 1
+    printf 'Pruning stale refs with case-colliding names one at a time.\n'
+    while IFS=' ' read -r old_oid ref; do
+        # Expected values protect concurrent updates; never remove lock files.
+        git update-ref --no-deref -d "$ref" "$old_oid" || return 1
+        printf ' * [pruned individually] %s\n' "${ref#refs/remotes/}"
+    done <<< "$collisions"
+}
+
 dry_run=false
 case "${1-}" in
     --dry-run) dry_run=true ;;
@@ -18,6 +59,10 @@ if $dry_run; then
     git worktree prune --dry-run || exit 1
 else
     git remote prune origin || prune_failed=true
+    if $prune_failed && prune_case_collisions; then
+        printf 'Case-colliding stale refs removed; retrying normal remote pruning.\n'
+        git remote prune origin && prune_failed=false
+    fi
     git worktree prune || exit 1
 fi
 status=0
