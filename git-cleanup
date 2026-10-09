@@ -2,11 +2,29 @@
 # Delete merged branches, asking before removing their linked worktrees.
 set -u
 
+dry_run=false
+case "${1-}" in
+    --dry-run) dry_run=true ;;
+    '') ;;
+    *) printf 'Usage: git cleanup [--dry-run]\n' >&2; exit 2 ;;
+esac
+
 current_worktree=$(git rev-parse --show-toplevel) || exit 1
 current_branch=$(git symbolic-ref --quiet HEAD || true)
 current_branch=${current_branch#refs/heads/}
-git remote prune origin || exit 1
-git worktree prune || exit 1
+prune_failed=false
+if $dry_run; then
+    git remote prune --dry-run origin || prune_failed=true
+    git worktree prune --dry-run || exit 1
+else
+    git remote prune origin || prune_failed=true
+    git worktree prune || exit 1
+fi
+status=0
+if $prune_failed; then
+    printf 'Remote ref pruning failed; continuing with local branch and worktree cleanup.\n' >&2
+    status=1
+fi
 branches=$(git branch --format='%(refname:lstrip=2)' --merged=HEAD) || exit 1
 
 # NUL-delimited porcelain preserves spaces, newlines, and quoted path names.
@@ -24,13 +42,62 @@ while IFS= read -r -d '' field; do
     esac
 done < <(git worktree list --porcelain -z)
 
-status=0
+# Squash/rebase merges do not preserve ancestry. Only trust a merged PR when
+# its exact head matches the local branch and its merge commit is in HEAD.
+github_repo=''
+origin_url=$(git config --get remote.origin.url)
+case "$origin_url" in
+    git@github.com:*) github_repo=${origin_url#git@github.com:} ;;
+    https://github.com/*) github_repo=${origin_url#https://github.com/} ;;
+    ssh://git@github.com/*) github_repo=${origin_url#ssh://git@github.com/} ;;
+esac
+github_repo=${github_repo%.git}
+squash_branches=()
+squash_tips=()
+if [[ -n "$github_repo" && -n "$current_branch" && ${#worktree_paths[@]} -gt 1 ]]; then
+    if ! command -v gh >/dev/null 2>&1; then
+        printf 'GitHub CLI unavailable; checking Git ancestry only.\n' >&2
+    elif prs=$(gh pr list --repo "$github_repo" --state merged --base "$current_branch" \
+        --limit 1000 --json headRefName,headRefOid,mergeCommit,number,isCrossRepository \
+        --jq '.[] | select(.isCrossRepository == false) | [.headRefName, .headRefOid, .mergeCommit.oid, .number] | @tsv'); then
+        while IFS=$'\t' read -r branch tip merge_commit pr; do
+            [[ -n "$branch" && -n "$tip" && -n "$merge_commit" ]] || continue
+            linked=false
+            for checked_out in "${worktree_branches[@]}"; do
+                [[ "$checked_out" == "$branch" ]] && linked=true
+            done
+            $linked || continue
+            local_tip=$(git rev-parse --verify "refs/heads/$branch" 2>/dev/null) || continue
+            [[ "$local_tip" == "$tip" ]] || continue
+            git merge-base --is-ancestor "$tip" HEAD 2>/dev/null && continue
+            git merge-base --is-ancestor "$merge_commit" HEAD 2>/dev/null || continue
+            # A branch can have multiple merged PRs; include it only once.
+            duplicate=false
+            for ((j=0; j<${#squash_branches[@]}; j++)); do
+                [[ "${squash_branches[j]}" == "$branch" ]] && duplicate=true
+            done
+            $duplicate && continue
+            squash_branches+=("$branch")
+            squash_tips+=("$tip")
+            branches+=$'\n'"$branch"
+            printf 'Found linked branch %s from merged PR #%s.\n' "$branch" "$pr"
+        done <<< "$prs"
+    else
+        printf 'Could not check GitHub for squash/rebase merges; checking Git ancestry only.\n' >&2
+    fi
+fi
+
 # Keep branch enumeration on a separate descriptor so prompts read user input.
 while IFS= read -r branch <&3; do
     case "$branch" in
         ''|main|develop) continue ;;
     esac
     [[ "$branch" == "$current_branch" ]] && continue
+
+    squash_tip=''
+    for ((i=0; i<${#squash_branches[@]}; i++)); do
+        [[ "${squash_branches[i]}" == "$branch" ]] && squash_tip=${squash_tips[i]}
+    done
 
     # The first entry is the main worktree; never try to remove it.
     protected=false
@@ -49,6 +116,11 @@ while IFS= read -r branch <&3; do
     for ((i=0; i<${#worktree_paths[@]}; i++)); do
         [[ "${worktree_branches[i]}" == "$branch" ]] || continue
         path=${worktree_paths[i]}
+        if $dry_run; then
+            printf 'Would remove worktree "%s" and delete merged branch %s.\n' "$path" "$branch"
+            keep=true
+            continue
+        fi
         while true; do
             printf 'Remove worktree "%s" and delete merged branch "%s"? [y/N] ' "$path" "$branch"
             answer=''
@@ -58,6 +130,13 @@ while IFS= read -r branch <&3; do
             fi
             case "$answer" in
                 y|Y|yes|YES|Yes)
+                    if [[ -n "$squash_tip" ]] &&
+                       [[ "$(git rev-parse --verify "refs/heads/$branch")" != "$squash_tip" ]]; then
+                        printf 'Keeping %s: branch changed since the merged PR check.\n' "$branch" >&2
+                        keep=true
+                        status=1
+                        break
+                    fi
                     if ! git worktree remove -- "$path"; then
                         printf 'Keeping %s: worktree removal failed.\n' "$branch" >&2
                         keep=true
@@ -75,6 +154,18 @@ while IFS= read -r branch <&3; do
         done
         $keep && break
     done
-    $keep || git branch -d -- "$branch" || status=1
+    $keep && continue
+    if $dry_run; then
+        printf 'Would delete merged branch %s.\n' "$branch"
+    elif [[ -n "$squash_tip" ]]; then
+        if [[ "$(git rev-parse --verify "refs/heads/$branch")" == "$squash_tip" ]]; then
+            git branch -D -- "$branch" || status=1
+        else
+            printf 'Keeping %s: branch changed since the merged PR check.\n' "$branch" >&2
+            status=1
+        fi
+    else
+        git branch -d -- "$branch" || status=1
+    fi
 done 3<<< "$branches"
 exit "$status"
