@@ -1,0 +1,80 @@
+#!/bin/bash
+# Delete merged branches, asking before removing their linked worktrees.
+set -u
+
+current_worktree=$(git rev-parse --show-toplevel) || exit 1
+current_branch=$(git symbolic-ref --quiet HEAD || true)
+current_branch=${current_branch#refs/heads/}
+git remote prune origin || exit 1
+git worktree prune || exit 1
+branches=$(git branch --format='%(refname:lstrip=2)' --merged=HEAD) || exit 1
+
+# NUL-delimited porcelain preserves spaces, newlines, and quoted path names.
+worktree_paths=()
+worktree_branches=()
+while IFS= read -r -d '' field; do
+    case "$field" in
+        'worktree '*)
+            worktree_paths+=("${field#worktree }")
+            worktree_branches+=('')
+            ;;
+        'branch refs/heads/'*)
+            worktree_branches[${#worktree_paths[@]}-1]=${field#branch refs/heads/}
+            ;;
+    esac
+done < <(git worktree list --porcelain -z)
+
+status=0
+# Keep branch enumeration on a separate descriptor so prompts read user input.
+while IFS= read -r branch <&3; do
+    case "$branch" in
+        ''|main|develop) continue ;;
+    esac
+    [[ "$branch" == "$current_branch" ]] && continue
+
+    # The first entry is the main worktree; never try to remove it.
+    protected=false
+    for ((i=0; i<${#worktree_paths[@]}; i++)); do
+        if [[ "${worktree_branches[i]}" == "$branch" ]] &&
+           { [[ $i == 0 ]] || [[ "${worktree_paths[i]}" == "$current_worktree" ]]; }; then
+            protected=true
+        fi
+    done
+    if $protected; then
+        printf 'Keeping %s: checked out in the main or current worktree.\n' "$branch"
+        continue
+    fi
+
+    keep=false
+    for ((i=0; i<${#worktree_paths[@]}; i++)); do
+        [[ "${worktree_branches[i]}" == "$branch" ]] || continue
+        path=${worktree_paths[i]}
+        while true; do
+            printf 'Remove worktree "%s" and delete merged branch "%s"? [y/N] ' "$path" "$branch"
+            answer=''
+            if ! IFS= read -r answer; then
+                printf '\n'
+                answer=n
+            fi
+            case "$answer" in
+                y|Y|yes|YES|Yes)
+                    if ! git worktree remove -- "$path"; then
+                        printf 'Keeping %s: worktree removal failed.\n' "$branch" >&2
+                        keep=true
+                        status=1
+                    fi
+                    break
+                    ;;
+                ''|n|N|no|NO|No)
+                    printf 'Keeping worktree and branch %s.\n' "$branch"
+                    keep=true
+                    break
+                    ;;
+                *) printf 'Please answer y or n.\n' ;;
+            esac
+        done
+        $keep && break
+    done
+    $keep || git branch -d -- "$branch" || status=1
+done 3<<< "$branches"
+exit "$status"

@@ -3,7 +3,7 @@
 	email = kyle@kylegoggin.com
 [alias]
 	undo = reset --soft HEAD^
-	cleanup = !git remote prune origin && git branch --merged | egrep -v '(^\\*|main|develop)' | xargs git branch -d
+	cleanup = !\"$HOME/.local/bin/git-cleanup\"
 [filter "lfs"]
 	required = true
 	clean = git-lfs clean -- %f
