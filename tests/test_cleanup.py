@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import shlex
+import select
 import shutil
 import subprocess
 import tempfile
@@ -45,8 +46,19 @@ class CleanupTest(unittest.TestCase):
         return self.git("show-ref", "--verify", "--quiet",
                         "refs/heads/" + branch, check=False).returncode == 0
 
-    def cleanup(self, answer="", cwd=None):
-        return self.git("cleanup-test", input=answer, check=False, cwd=cwd)
+    def cleanup(self, answer="y\n", cwd=None):
+        # Existing behavior tests choose the same actions through the batch
+        # fallback. No deletion occurs until the final y below.
+        answers = answer.splitlines()
+        if not answers or not any(a.lower() in ('y', 'yes') for a in answers):
+            batch = "\n"
+        elif len(answers) == 1:
+            batch = "all\ny\n"
+        else:
+            choices = [str(i + 1) for i, a in enumerate(answers)
+                       if a.lower() in ('y', 'yes')]
+            batch = ",".join(choices) + "\ny\n"
+        return self.git("cleanup-test", input=batch, check=False, cwd=cwd)
 
     def squash_worktree(self):
         path = self.worktree()
@@ -223,8 +235,8 @@ class CleanupTest(unittest.TestCase):
 
     def test_invalid_answer_reprompts(self):
         path = self.worktree()
-        result = self.cleanup("maybe\ny\n")
-        self.assertIn("Please answer y or n", result.stdout)
+        result = self.git("cleanup-test", input="invalid\nall\ny\n", check=False)
+        self.assertIn("Invalid selection", result.stdout)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(path.exists())
         self.assertFalse(self.has_branch("topic"))
@@ -552,6 +564,115 @@ class CleanupTest(unittest.TestCase):
         self.assertIn('branch changed since the cleanup check', result.stderr)
         self.assertTrue(path.exists())
         self.assertTrue(self.has_branch('topic'))
+
+
+
+    def scanned_batch(self):
+        process = subprocess.Popen(['git', 'cleanup-test'], cwd=self.repo,
+                                   env=self.env, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+        output = b''
+        deadline = time.monotonic() + 15
+        while b'Select numbers/ranges or all' not in output:
+            if time.monotonic() > deadline or process.poll() is not None:
+                self.fail(f'Batch selector did not appear: {output!r}')
+            if select.select([process.stdout], [], [], 0.1)[0]:
+                output += os.read(process.stdout.fileno(), 65536)
+        return process, output
+
+    def test_batch_waits_for_all_selections_before_removing_anything(self):
+        first = self.worktree('a', 'first')
+        second = self.worktree('b', 'second')
+        process, output = self.scanned_batch()
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+        self.assertIn(b'first', output)
+        self.assertIn(b'second', output)
+        remaining, errors = process.communicate(b'all\ny\n', timeout=15)
+        self.assertEqual(process.returncode, 0, errors.decode())
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertIn(b'[1/2]', remaining)
+        self.assertIn(b'[2/2]', remaining)
+        self.assertIn(b'2 actions completed', remaining)
+
+    def test_batch_cancel_keeps_worktrees_and_branch_only_candidates(self):
+        path = self.worktree()
+        self.git('branch', 'orphan')
+        result = self.git('cleanup-test', input='all\nn\n\n', check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Cleanup cancelled', result.stdout)
+        self.assertTrue(path.exists())
+        self.assertTrue(self.has_branch('topic'))
+        self.assertTrue(self.has_branch('orphan'))
+
+    def test_batch_eof_before_final_confirmation_does_not_remove_anything(self):
+        path = self.worktree()
+        result = self.git('cleanup-test', input='all\n', check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(path.exists())
+        self.assertTrue(self.has_branch('topic'))
+
+    def test_batch_skips_newly_dirty_checkout_and_continues_with_next(self):
+        first = self.worktree('a', 'first')
+        second = self.worktree('b', 'second')
+        process, _ = self.scanned_batch()
+        (first / 'new-work.txt').write_text('Created while checklist was open\n')
+        output, errors = process.communicate(b'all\ny\n', timeout=15)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertTrue(first.exists())
+        self.assertTrue(self.has_branch('a'))
+        self.assertFalse(second.exists())
+        self.assertFalse(self.has_branch('b'))
+        self.assertIn(b'1 actions completed; 1 skipped or failed', output)
+
+    def test_batch_commit_while_selecting_preserves_idle_worktree(self):
+        path = self.worktree()
+        self.dated_commit(path, 8)
+        process, _ = self.scanned_batch()
+        self.git('commit', '--allow-empty', '-m', 'New work during selection', cwd=path)
+        tip = self.git('rev-parse', 'topic').stdout
+        output, errors = process.communicate(b'all\ny\n', timeout=15)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn(b'branch changed since the cleanup check', errors)
+        self.assertTrue(path.exists())
+        self.assertEqual(self.git('rev-parse', 'topic').stdout, tip)
+
+    def test_batch_new_nested_worktree_prevents_parent_removal(self):
+        parent = self.worktree()
+        self.dated_commit(parent, 8)
+        process, _ = self.scanned_batch()
+        child = parent / 'new-nested-worktree'
+        self.git('worktree', 'add', '-b', 'child', str(child), 'topic')
+        output, errors = process.communicate(b'all\ny\n', timeout=15)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn(b'now contains another worktree', errors)
+        self.assertTrue(parent.exists())
+        self.assertTrue(child.exists())
+        self.assertTrue(self.has_branch('topic'))
+
+    def test_batch_branch_only_update_during_selection_is_preserved(self):
+        self.git('branch', 'orphan')
+        process, _ = self.scanned_batch()
+        tip = self.git('commit-tree', 'HEAD^{tree}', '-p', 'HEAD', '-m', 'New work').stdout.strip()
+        self.git('update-ref', 'refs/heads/orphan', tip)
+        output, errors = process.communicate(b'all\ny\n', timeout=15)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(self.git('rev-parse', 'orphan').stdout.strip(), tip)
+        self.assertIn(b'branch changed since the cleanup check', errors)
+
+    def test_both_worktrees_are_visible_when_a_branch_is_checked_out_twice(self):
+        first = self.worktree()
+        second = self.root / 'second copy'
+        self.git('worktree', 'add', '--force', str(second), 'topic')
+        result = self.git('cleanup-test', input='\n', check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(first), result.stdout)
+        self.assertIn(str(second), result.stdout)
+        self.assertIn('branch is checked out in multiple worktrees', result.stdout)
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
 
 
 

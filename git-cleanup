@@ -50,6 +50,12 @@ case "${1-}" in
     *) printf 'Usage: git cleanup [--dry-run]\n' >&2; exit 2 ;;
 esac
 
+if ! $dry_run; then
+    command -v python3 >/dev/null 2>&1 || { printf 'git cleanup requires Python 3 for its checklist.\n' >&2; exit 1; }
+    selector="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/git-cleanup-select.py"
+    [[ -r "$selector" ]] || { printf 'Missing checklist helper: %s\n' "$selector" >&2; exit 1; }
+fi
+
 current_worktree=$(git rev-parse --show-toplevel) || exit 1
 current_branch=$(git symbolic-ref --quiet HEAD || true)
 current_branch=${current_branch#refs/heads/}
@@ -145,46 +151,55 @@ worktree_git() (
     git --no-optional-locks -C "$@"
 )
 
-confirm() {
-    local answer
-    while true; do
-        printf '%s [y/N] ' "$1"
-        answer=''
-        if ! IFS= read -r answer; then
-            printf '\n'
-            return 1
-        fi
-        case "$answer" in
-            y|Y|yes|YES|Yes) return 0 ;;
-            ''|n|N|no|NO|No) return 1 ;;
-            *) printf 'Please answer y or n.\n' ;;
-        esac
-    done
+# Collect every worktree and all eligible branch-only actions before asking
+# for any selection. No branch or worktree deletion occurs during discovery.
+entry_paths=()
+entry_branches=()
+entry_tips=()
+entry_modes=()
+entry_reasons=()
+record_entry() {
+    entry_paths+=("$path")
+    entry_branches+=("$branch")
+    entry_tips+=("$tip")
+    entry_modes+=("$1")
+    entry_reasons+=("$2")
+}
+keep_worktree() {
+    if [[ -n "$path" ]]; then
+        printf 'Keeping %s: %s.\n' "$branch" "$1"
+        record_entry keep "$1"
+    fi
 }
 
-# Snapshot the branch tips. Recheck each tip before removing its worktree or
-# deleting the branch, including after a user has spent time at a prompt.
 branches=$(git for-each-ref --format='%(refname:strip=2) %(objectname)' refs/heads/) || exit 1
 while IFS=' ' read -r branch tip <&3; do
     [[ -n "$branch" ]] || continue
     path=''
     linked_index=-1
+    linked_count=0
     for ((i=0; i<${#worktree_paths[@]}; i++)); do
         if [[ "${worktree_branches[i]}" == "$branch" ]]; then
             path=${worktree_paths[i]}
             linked_index=$i
-            break
+            linked_count=$((linked_count + 1))
         fi
     done
+    if [[ $linked_count -gt 1 ]]; then
+        for ((i=0; i<${#worktree_paths[@]}; i++)); do
+            if [[ "${worktree_branches[i]}" == "$branch" ]]; then
+                path=${worktree_paths[i]}
+                keep_worktree 'branch is checked out in multiple worktrees'
+            fi
+        done
+        continue
+    fi
     case "$branch" in
-        main|develop)
-            [[ -z "$path" ]] || printf 'Keeping %s: protected branch.\n' "$branch"
-            continue
-            ;;
+        main|develop) keep_worktree 'protected branch'; continue ;;
     esac
     if [[ "$branch" == "$current_branch" ]] ||
        { [[ -n "$path" ]] && { [[ $linked_index == 0 ]] || [[ "$path" == "$current_worktree" ]]; }; }; then
-        printf 'Keeping %s: checked out in the main or current worktree.\n' "$branch"
+        keep_worktree 'checked out in the main or current worktree'
         continue
     fi
 
@@ -192,11 +207,11 @@ while IFS=' ' read -r branch tip <&3; do
     reason=''
     if [[ -n "$path" ]]; then
         if ! [[ -d "$path" ]]; then
-            printf 'Keeping %s: worktree path is missing; registration needs pruning.\n' "$branch"
+            keep_worktree 'worktree path is missing; registration needs pruning'
             continue
         fi
         if ${worktree_locked[linked_index]}; then
-            printf 'Keeping %s: worktree is locked.\n' "$branch"
+            keep_worktree 'worktree is locked'
             status=1
             continue
         fi
@@ -208,10 +223,10 @@ while IFS=' ' read -r branch tip <&3; do
             fi
         done
         if $contains_worktree; then
-            printf 'Keeping %s: contains another registered worktree; clean up children first.\n' "$branch"
+            keep_worktree 'contains another registered worktree; clean up children first'
             continue
         fi
-        commit_time=$(git show -s --format=%ct "$tip") || { status=1; continue; }
+        commit_time=$(git show -s --format=%ct "$tip") || { status=1; keep_worktree 'could not read branch commit'; continue; }
         if [[ $commit_time -le $idle_cutoff ]]; then
             mode=retain
             reason="idle: last commit $(((now - commit_time) / 86400)) days ago"
@@ -221,7 +236,6 @@ while IFS=' ' read -r branch tip <&3; do
         mode=delete
         reason='merged into origin/main by Git ancestry'
     fi
-
     # Query all PRs for this branch, with pagination, rather than a repository-
     # wide window of recent merges. Open PRs can also explain a retained branch.
     if [[ -z "$mode" && -n "$path" ]]; then
@@ -272,62 +286,145 @@ while IFS=' ' read -r branch tip <&3; do
         fi
     fi
     if [[ -z "$mode" ]]; then
-        [[ -z "$path" ]] || printf 'Keeping %s: %s; last commit is less than 7 days old.\n' "$branch" "$reason"
+        keep_worktree "$reason; last commit is less than 7 days old"
         continue
     fi
-
     if [[ -n "$path" ]]; then
-        dirty=$(worktree_git "$path" status --porcelain --untracked-files=normal) || { status=1; continue; }
+        dirty=$(worktree_git "$path" status --porcelain --untracked-files=normal) || {
+            status=1
+            keep_worktree 'could not read worktree status'
+            continue
+        }
         if [[ -n "$dirty" ]]; then
-            printf 'Keeping %s: worktree has uncommitted or untracked changes (%s).\n' "$branch" "$reason"
+            keep_worktree "worktree has uncommitted or untracked changes ($reason)"
             status=1
             continue
         fi
         printf 'Candidate %s: %s.\n' "$branch" "$reason"
-        if [[ "$mode" == retain ]]; then
-            branch_action=retain
-        else
-            branch_action='delete merged'
-        fi
-        action="remove worktree \"$path\" and $branch_action branch \"$branch\""
         if $dry_run; then
-            printf 'Would %s.\n' "$action"
-            continue
+            if [[ "$mode" == retain ]]; then
+                printf 'Would remove worktree "%s" and retain branch "%s".\n' "$path" "$branch"
+            else
+                printf 'Would remove worktree "%s" and delete merged branch "%s".\n' "$path" "$branch"
+            fi
         fi
-        if ! confirm "Remove worktree \"$path\" and $branch_action branch \"$branch\"?"; then
-            printf 'Keeping worktree and branch %s.\n' "$branch"
-            continue
+    elif $dry_run; then
+        printf 'Would delete merged branch %s.\n' "$branch"
+    fi
+    record_entry "$mode" "$reason"
+done 3<<< "$branches"
+for ((i=0; i<${#worktree_paths[@]}; i++)); do
+    if [[ -z "${worktree_branches[i]}" ]]; then
+        path=${worktree_paths[i]}
+        branch=''
+        tip=''
+        reason='detached HEAD; no branch to retain'
+        if [[ $i == 0 || "$path" == "$current_worktree" ]]; then
+            reason='detached main or current worktree; protected checkout'
         fi
-        if [[ "$(git rev-parse --verify "refs/heads/$branch")" != "$tip" ]] ||
-           [[ "$(worktree_git "$path" symbolic-ref --quiet HEAD)" != "refs/heads/$branch" ]]; then
-            printf 'Keeping %s: branch changed since the cleanup check.\n' "$branch" >&2
+        printf 'Keeping worktree "%s": %s.\n' "$path" "$reason"
+        record_entry keep "$reason"
+    fi
+done
+$dry_run && exit "$status"
+
+# The selector writes numeric inventory IDs only after one final confirmation.
+# Its NUL-separated input preserves spaces, quotes, and newlines in paths.
+for ((i=0; i<${#entry_paths[@]}; i++)); do
+    printf '%s\0' "${entry_paths[i]}" "${entry_branches[i]}" \
+        "${entry_tips[i]}" "${entry_modes[i]}" "${entry_reasons[i]}"
+done > "$scratch/inventory"
+if python3 "$selector" "$scratch/inventory" "$scratch/selected"; then
+    :
+else
+    selector_status=$?
+    if [[ $selector_status == 130 ]]; then
+        printf 'Cleanup cancelled; no worktrees or branches removed.\n'
+        exit "$status"
+    fi
+    exit 1
+fi
+selected=()
+selected_flags=()
+while IFS= read -r row; do
+    case "$row" in
+        ''|*[!0-9]*) printf 'Invalid cleanup selection.\n' >&2; exit 1 ;;
+    esac
+    if [[ ${#row} -gt 6 ]] || [[ $row -ge ${#entry_paths[@]} ]] ||
+       [[ "${entry_modes[row]}" == keep || -n "${selected_flags[row]-}" ]]; then
+        printf 'Invalid cleanup selection.\n' >&2
+        exit 1
+    fi
+    selected_flags[row]=true
+    selected+=("$row")
+done < "$scratch/selected"
+
+# Recheck nesting as well as commit and checkout identity: another process may
+# have created a child worktree while the checklist was open.
+has_nested_worktree() {
+    local field child
+    while IFS= read -r -d '' field; do
+        case "$field" in
+            'worktree '*)
+                child=${field#worktree }
+                if [[ "$child" == "$1/"* && -d "$child" ]]; then
+                    return 0
+                fi
+                ;;
+        esac
+    done < <(git worktree list --porcelain -z)
+    return 1
+}
+completed=0
+failed=0
+for ((position=0; position<${#selected[@]}; position++)); do
+    i=${selected[position]}
+    path=${entry_paths[i]}
+    branch=${entry_branches[i]}
+    tip=${entry_tips[i]}
+    mode=${entry_modes[i]}
+    printf '\n[%s/%s] %s\n' "$((position + 1))" "${#selected[@]}" "$branch"
+    if [[ "$(git rev-parse --verify "refs/heads/$branch")" != "$tip" ]]; then
+        printf 'Keeping %s: branch changed since the cleanup check.\n' "$branch" >&2
+        failed=$((failed + 1))
+        status=1
+        continue
+    fi
+    if [[ -n "$path" ]]; then
+        if [[ "$(worktree_git "$path" symbolic-ref --quiet HEAD)" != "refs/heads/$branch" ]] ||
+           has_nested_worktree "$path"; then
+            printf 'Keeping %s: checkout changed or now contains another worktree.\n' "$branch" >&2
+            failed=$((failed + 1))
             status=1
             continue
         fi
+        printf 'Removing worktree "%s"...\n' "$path"
         if ! git worktree remove -- "$path"; then
             printf 'Keeping %s: worktree removal failed.\n' "$branch" >&2
+            failed=$((failed + 1))
             status=1
             continue
         fi
         if [[ "$mode" == retain ]]; then
             printf 'Removed worktree; retained branch %s at %s.\n' "$branch" "${tip:0:12}"
+            completed=$((completed + 1))
             continue
         fi
     fi
-    if $dry_run; then
-        printf 'Would delete merged branch %s.\n' "$branch"
-    elif [[ "$(git rev-parse --verify "refs/heads/$branch")" == "$tip" ]]; then
-        # The frozen main tip or an exact merged PR proves this tip merged.
-        # -d would instead consult the branch upstream or the invoking HEAD.
-        git branch -D -- "$branch" || status=1
+    if [[ "$(git rev-parse --verify "refs/heads/$branch")" == "$tip" ]]; then
+        # Verification uses the frozen main commit, not the invoking HEAD or
+        # branch upstream. Git still refuses deletion of a checked-out branch.
+        if git branch -D -- "$branch"; then
+            completed=$((completed + 1))
+        else
+            failed=$((failed + 1))
+            status=1
+        fi
     else
         printf 'Keeping %s: branch changed since the cleanup check.\n' "$branch" >&2
+        failed=$((failed + 1))
         status=1
     fi
-done 3<<< "$branches"
-for ((i=1; i<${#worktree_paths[@]}; i++)); do
-    if [[ -z "${worktree_branches[i]}" ]]; then
-        printf 'Keeping worktree "%s": detached HEAD; no branch to retain.\n' "${worktree_paths[i]}"
-    fi
 done
+printf '\nBatch complete: %s actions completed; %s skipped or failed.\n' "$completed" "$failed"
 exit "$status"
