@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""Read-only allocated-space audit of Git repositories and all registered worktrees."""
+
+import argparse
+import collections
+import datetime
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+MEASUREMENT = (
+    "Allocated bytes (st_blocks * 512); directory symlinks are not followed; "
+    "file hard links counted once across the audit. APFS shared clone "
+    "extents cannot be deduplicated."
+)
+
+
+def inside(path, root):
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+class Audit:
+    def __init__(self, base, quiet=False):
+        self.base = os.path.realpath(base)
+        self.quiet = quiet
+        self.checkouts = {}
+        self.groups = {}
+        self.errors = []
+        self.seen_files = set()
+        self.visited = set()
+        self.deferred = {}
+        self.other = collections.Counter()
+        self.scanned = []
+        self.files = 0
+        self.base_bytes = 0
+        self.external_bytes = 0
+        self.start = self.last = time.monotonic()
+
+    def log(self, message):
+        if not self.quiet:
+            print(message, file=sys.stderr, flush=True)
+
+    def error(self, path, error):
+        self.errors.append({"path": path, "error": str(error)})
+
+    @staticmethod
+    def git(path, *args):
+        result = subprocess.run(
+            ["git", "-C", path, *args],
+            capture_output=True,
+            check=False,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+        if result.returncode:
+            raise RuntimeError(os.fsdecode(result.stderr).strip())
+        return result.stdout
+
+    def register(self, path):
+        path = os.path.realpath(path)
+        if path in self.checkouts:
+            return path
+        try:
+            common = os.path.realpath(
+                os.fsdecode(
+                    self.git(
+                        path, "rev-parse", "--path-format=absolute", "--git-common-dir"
+                    )
+                ).rstrip("\n")
+            )
+        except (OSError, RuntimeError) as error:
+            self.error(path, error)
+            return None
+        self.checkouts[path] = {
+            "path": path,
+            "common": common,
+            "bytes": 0,
+            "dependencies_bytes": 0,
+            "metadata_bytes": 0,
+            "top": collections.Counter(),
+        }
+        self.groups.setdefault(common, {"common": common, "registered": []})
+        self.log("Repository/worktree: " + path)
+        return path
+
+    def scan(self, root, owner=None, meta=False, dep=False, defer=True):
+        # Iterative traversal handles deep dependency trees without a recursion limit.
+        stack = [(root, owner, dep, meta)]
+        while stack:
+            path, owner, dep, meta = stack.pop()
+            if path in self.visited:
+                continue
+            try:
+                info = os.lstat(path)
+                entries = None
+                if stat.S_ISDIR(info.st_mode):
+                    self.visited.add(path)
+                    with os.scandir(path) as listing:
+                        entries = sorted(listing, key=lambda entry: entry.name)
+                    names = {entry.name for entry in entries}
+                    bare = False
+                    if path in self.groups:
+                        owner = next(
+                            p for p, c in self.checkouts.items() if c["common"] == path
+                        )
+                        dep, meta = False, True
+                    elif ".git" not in names and {"HEAD", "objects", "refs"} <= names:
+                        # A separate Git directory may sort before its checkout.
+                        # Wait until checkout discovery can establish its owner.
+                        if defer:
+                            self.deferred[path] = (owner, dep, meta)
+                            self.visited.remove(path)
+                            continue
+                        try:
+                            bare = (
+                                self.git(
+                                    path, "rev-parse", "--is-bare-repository"
+                                ).strip()
+                                == b"true"
+                            )
+                        except RuntimeError:
+                            pass
+                    if ".git" in names or bare:
+                        owner = self.register(path) or owner
+                        dep, meta = False, bare
+                amount = info.st_blocks * 512
+                if not stat.S_ISDIR(info.st_mode) and info.st_nlink > 1:
+                    key = (info.st_dev, info.st_ino)
+                    if key in self.seen_files:
+                        amount = 0
+                    else:
+                        self.seen_files.add(key)
+                if inside(path, self.base):
+                    self.base_bytes += amount
+                else:
+                    self.external_bytes += amount
+                if owner:
+                    row = self.checkouts[owner]
+                    row["bytes"] += amount
+                    component = os.path.relpath(path, owner).split(os.sep)[0]
+                    row["top"][component] += amount
+                    if dep:
+                        row["dependencies_bytes"] += amount
+                    if meta:
+                        row["metadata_bytes"] += amount
+                else:
+                    component = os.path.relpath(path, self.base).split(os.sep)[0]
+                    self.other[component] += amount
+                if entries is not None:
+                    stack.extend(
+                        (
+                            entry.path,
+                            owner,
+                            dep or entry.name == "node_modules",
+                            meta or entry.name == ".git",
+                        )
+                        for entry in reversed(entries)
+                    )
+                else:
+                    self.files += 1
+                if time.monotonic() - self.last > 20:
+                    self.log(
+                        f"Progress: {self.files:,} files; "
+                        f"{time.monotonic() - self.start:.0f} seconds; {path}"
+                    )
+                    self.last = time.monotonic()
+            except (OSError, RuntimeError) as error:
+                self.error(path, error)
+
+    def run(self):
+        self.scan(self.base)
+        self.scanned.append(self.base)
+        processed = set()
+        # External checkouts can contain nested clones with their own external
+        # worktrees, so continue discovery until no new common Git directories remain.
+        while set(self.groups) - processed or self.deferred:
+            deferred, self.deferred = self.deferred, {}
+            for path, (owner, dep, meta) in deferred.items():
+                self.scan(path, owner, meta=meta, dep=dep, defer=False)
+            for common in sorted(set(self.groups) - processed):
+                processed.add(common)
+                group = self.groups[common]
+                representative = next(
+                    p for p, c in self.checkouts.items() if c["common"] == common
+                )
+                try:
+                    raw = self.git(
+                        representative, "worktree", "list", "--porcelain", "-z"
+                    )
+                    current = {}
+                    for token in raw.split(b"\0"):
+                        if not token:
+                            if current:
+                                group["registered"].append(current)
+                                current = {}
+                        else:
+                            key, _, value = os.fsdecode(token).partition(" ")
+                            current[key] = value if value else True
+                    if current:
+                        group["registered"].append(current)
+                except (OSError, RuntimeError) as error:
+                    self.error(common, error)
+                paths = [
+                    os.path.realpath(row["worktree"])
+                    for row in group["registered"]
+                    if row.get("worktree") and os.path.isdir(row["worktree"])
+                ]
+                # Parents first, to give nested repositories their own attribution.
+                for path in sorted(paths, key=lambda p: (len(Path(p).parts), p)):
+                    if path in self.visited:
+                        continue
+                    owner = self.register(path)
+                    if owner:
+                        self.scan(path, owner)
+                        self.scanned.append(path)
+                if os.path.isdir(common) and common not in self.visited:
+                    self.scan(common, representative, meta=True)
+                    self.scanned.append(common)
+        return {
+            "base": self.base,
+            "created": datetime.datetime.now()
+            .astimezone()
+            .isoformat(timespec="seconds"),
+            "elapsed_seconds": round(time.monotonic() - self.start),
+            "files": self.files,
+            "checkouts": list(self.checkouts.values()),
+            "groups": list(self.groups.values()),
+            "other": dict(self.other),
+            "errors": self.errors,
+            "scanned": self.scanned,
+            "base_bytes": self.base_bytes,
+            "external_bytes": self.external_bytes,
+            "measurement": MEASUREMENT,
+        }
+
+
+def write_reports(d, output):
+    import csv
+    import html
+    import json
+
+    output = Path(output)
+    base = d["base"]
+    home = os.path.expanduser("~")
+    org_root = next(
+        (str(p) for p in (Path(base), *Path(base).parents) if p.name == "zendesk"),
+        os.path.join(base, "zendesk"),
+    )
+
+    def short(p):
+        return "~" + p[len(home) :] if p.startswith(home + "/") else p
+
+    def md(p):
+        return (
+            short(p)
+            .replace("\\", "\\\\")
+            .replace("|", "\\|")
+            .replace("\n", "<br>")
+            .replace("\r", "")
+        )
+
+    def fmt(b):
+        for unit, n in [("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)]:
+            if b >= n:
+                return f"{b / n:,.2f} {unit}"
+        return f"{b:,} B"
+
+    def esc(s):
+        return html.escape(str(s))
+
+    rows = []
+    for g in d["groups"]:
+        cs = [c for c in d["checkouts"] if c["common"] == g["common"]]
+        main = (
+            os.path.realpath(g["registered"][0]["worktree"])
+            if g["registered"]
+            else os.path.dirname(g["common"])
+        )
+        linked = [c for c in cs if c["path"] != main]
+        r = {
+            "name": os.path.basename(main),
+            "path": main,
+            "org": "Zendesk"
+            if any(inside(c["path"], org_root) for c in cs)
+            else "Other",
+            "bytes": sum(c["bytes"] for c in cs),
+            "main_bytes": sum(c["bytes"] for c in cs if c["path"] == main),
+            "worktree_bytes": sum(c["bytes"] for c in linked),
+            "worktree_count": len(linked),
+            "metadata_bytes": sum(c["metadata_bytes"] for c in cs),
+            "dependencies_bytes": sum(c["dependencies_bytes"] for c in cs),
+            "checkouts": sorted(cs, key=lambda c: -c["bytes"]),
+            "registered": g["registered"],
+            "common": g["common"],
+        }
+        rows.append(r)
+    for r in rows:
+        if not r["path"].startswith(base + "/"):
+            parents = [
+                (len(c["path"]), parent["org"])
+                for parent in rows
+                for c in parent["checkouts"]
+                if parent is not r and r["path"].startswith(c["path"] + "/")
+            ]
+            if parents:
+                r["org"] = max(parents)[1]
+    rows.sort(key=lambda r: -r["bytes"])
+    repo_total = sum(r["bytes"] for r in rows)
+    extra_total = sum(r["worktree_bytes"] for r in rows)
+    other_total = sum(d["other"].values())
+    code_total = d["base_bytes"]
+    external = d["external_bytes"]
+    summary = {
+        "repo_total_bytes": repo_total,
+        "linked_worktree_bytes": extra_total,
+        "linked_worktree_count": sum(r["worktree_count"] for r in rows),
+        "code_total_bytes": code_total,
+        "external_checkout_bytes": external,
+        "other_bytes": other_total,
+        "repo_count": len(rows),
+        "checkout_count": len(d["checkouts"]),
+        "dependencies_bytes": sum(r["dependencies_bytes"] for r in rows),
+        "metadata_bytes": sum(r["metadata_bytes"] for r in rows),
+        "orgs": {
+            org: sum(r["bytes"] for r in rows if r["org"] == org)
+            for org in ["Zendesk", "Other"]
+        },
+    }
+    d["summary"] = summary
+    d["repositories"] = rows
+    (output / "disk-audit.json").write_text(
+        json.dumps(d, indent=2) + "\n", encoding="utf-8"
+    )
+    with (output / "disk-audit.csv").open(
+        "w", newline="", encoding="utf-8", errors="backslashreplace"
+    ) as f:
+        fields = [
+            "org",
+            "name",
+            "path",
+            "bytes",
+            "main_bytes",
+            "worktree_count",
+            "worktree_bytes",
+            "dependencies_bytes",
+            "metadata_bytes",
+        ]
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    lines = [
+        "# Repository disk audit",
+        "",
+        f"Measured {d['created']}. Read-only scan; nothing deleted.",
+        "",
+        f"- {short(base)}: {fmt(code_total)}",
+        f"- All repository groups, including external registered worktrees: {fmt(repo_total)}",
+        f"- Additional linked worktrees: {summary['linked_worktree_count']} using {fmt(extra_total)}",
+        f"- node_modules within repos/worktrees: {fmt(summary['dependencies_bytes'])}",
+        f"- Git metadata: {fmt(summary['metadata_bytes'])}",
+        f"- Outside repositories in {short(base)}: {fmt(other_total)}",
+        "",
+        d["measurement"],
+        "",
+        "Main includes shared Git metadata. Nested repositories and worktrees are assigned separately to avoid double counting. Nested clones found inside external worktrees are also included and listed separately. Dependency and metadata columns are subsets of total, not additional space. Linked worktree bytes are attributed allocated bytes, not guaranteed reclaimable space because of hard links and APFS clones.",
+        "",
+    ]
+    for org in ["Zendesk", "Other"]:
+        lines += [
+            "## " + org,
+            "",
+            "| Repository | Total | Main + shared Git | Extra worktrees | Extra size | node_modules | Git metadata |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for r in rows:
+            if r["org"] == org:
+                lines.append(
+                    f"| {md(r['path'])} | {fmt(r['bytes'])} | {fmt(r['main_bytes'])} | {r['worktree_count']} | {fmt(r['worktree_bytes'])} | {fmt(r['dependencies_bytes'])} | {fmt(r['metadata_bytes'])} |"
+                )
+        lines.append("")
+    lines += [
+        "## Individual checkouts",
+        "",
+        "| Path | Kind | Allocated space | node_modules | Git metadata |",
+        "|---|---|---:|---:|---:|",
+    ]
+    for r in rows:
+        for c in r["checkouts"]:
+            lines.append(
+                f"| {md(c['path'])} | {('Main' if c['path'] == r['path'] else 'Linked worktree')} | {fmt(c['bytes'])} | {fmt(c['dependencies_bytes'])} | {fmt(c['metadata_bytes'])} |"
+            )
+    lines += [
+        "",
+        "## Largest directories inside checkouts",
+        "",
+        "| Path | Space |",
+        "|---|---:|",
+    ]
+    components = sorted(
+        [
+            (os.path.join(c["path"], p), b)
+            for c in d["checkouts"]
+            for p, b in c["top"].items()
+            if p != "."
+        ],
+        key=lambda x: -x[1],
+    )
+    for p, b in components[:40]:
+        lines.append(f"| {md(p)} | {fmt(b)} |")
+    lines += [
+        "",
+        "## Space outside repositories",
+        "",
+        "| Directory or file | Space |",
+        "|---|---:|",
+    ]
+    for p, b in sorted(d["other"].items(), key=lambda x: -x[1]):
+        lines.append(f"| {md(os.path.join(base, p))} | {fmt(b)} |")
+    lines += [
+        "",
+        "## Scan errors",
+        "",
+        json.dumps(d["errors"], indent=2) if d["errors"] else "None.",
+    ]
+    (output / "disk-audit.md").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8", errors="backslashreplace"
+    )
+    parts = [
+        '<!doctype html><html><head><meta charset="utf-8"><title>Repository disk audit</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:system-ui, sans-serif;color:#202124;margin:24px;max-width:1200px}p{line-height:1.5}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}th,td{text-align:right;padding:10px 6px;border-bottom:1px solid #d9dde3;vertical-align:top}th:first-child,td:first-child{text-align:left;width:60%}summary{cursor:pointer;overflow-wrap:anywhere}small,.muted{color:#60646c}.path{overflow-wrap:anywhere}.detail{padding:10px 0;line-height:1.6}.checkout{margin:8px 0}.stats{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:20px}.value{font-size:24px;font-weight:500}h3{font-size:16px;font-weight:500;margin-top:24px}th{font-weight:500}.number{white-space:nowrap}@media(max-width:440px){th,td{padding:9px 3px;font-size:12px}.stats{gap:16px}.value{font-size:21px}}</style></head><body>'
+    ]
+    parts.append(
+        '<div class="stats">'
+        + "".join(
+            (
+                f'<div><div class="muted">{esc(label)}</div><div class="value">{esc(value)}</div></div>'
+                for label, value in [
+                    ("All repos + worktrees", fmt(repo_total)),
+                    (
+                        "Extra worktrees",
+                        f"{summary['linked_worktree_count']} · {fmt(extra_total)}",
+                    ),
+                    (f"Outside repos in {short(base)}", fmt(other_total)),
+                ]
+            )
+        )
+        + "</div>"
+    )
+    parts.append(
+        f"""<p>{len(rows)} repository groups · {len(d["checkouts"])} checkouts · {esc(d["created"])}<br><span class="muted">Expand a repo for individual checkout paths and sizes. Sizes use allocated disk blocks; GiB = 1,024³ bytes.</span></p>"""
+    )
+    for org in ["Zendesk", "Other"]:
+        selected = [r for r in rows if r["org"] == org]
+        parts.append(
+            f"""<h3>{org} · {len(selected)} repos · {fmt(sum(r["bytes"] for r in selected))}</h3><table><thead><tr><th scope="col">Repository</th><th scope="col">Total</th><th scope="col">Extra worktrees</th></tr></thead><tbody>"""
+        )
+        for r in selected:
+            detail = f"""<div class="detail"><div class="path">{esc(short(r["path"]))}</div><div>Main + shared Git: {fmt(r["main_bytes"])}</div><div>All node_modules: {fmt(r["dependencies_bytes"])} · Git metadata: {fmt(r["metadata_bytes"])}</div>"""
+            for c in r["checkouts"]:
+                kind = "Main" if c["path"] == r["path"] else "Worktree"
+                detail += f"""<div class="checkout"><span class="path">{esc(short(c["path"]))}</span><br><small>{kind} · {fmt(c["bytes"])} · node_modules {fmt(c["dependencies_bytes"])}</small></div>"""
+                detail += (
+                    "<small>Largest directories in this checkout: "
+                    + esc(
+                        ", ".join(
+                            (
+                                p + " " + fmt(b)
+                                for p, b in sorted(
+                                    c["top"].items(), key=lambda x: -x[1]
+                                )[:4]
+                                if p != "."
+                            )
+                        )
+                    )
+                    + "</small>"
+                )
+            detail += "</div>"
+            extra = (
+                f"{r['worktree_count']} · {fmt(r['worktree_bytes'])}"
+                if r["worktree_count"]
+                else "—"
+            )
+            parts.append(
+                f"""<tr><td><details><summary>{esc(r["name"])}</summary>{detail}</details></td><td class="number">{fmt(r["bytes"])}</td><td class="number">{extra}</td></tr>"""
+            )
+        parts.append("</tbody></table>")
+    parts.append(
+        f"""<p class="muted">{esc(short(base))} itself: {fmt(code_total)}. Registered checkouts and shared Git directories outside {esc(short(base))}: {fmt(external)}. Shared Git metadata and hard-linked files are counted once; nested checkouts are excluded from their enclosing checkout. APFS clone sharing is not visible, so these totals are not a promise of reclaimable space. No files were deleted. Scan errors: {len(d["errors"])}.</p></body></html>"""
+    )
+    (output / "disk-audit.html").write_text(
+        "".join(parts), encoding="utf-8", errors="backslashreplace"
+    )
+    return summary
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "root",
+        nargs="?",
+        type=Path,
+        default=Path.home() / "Code",
+        help="directory to scan (default: ~/Code)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="report directory (default: ~/disk-audits/TIMESTAMP)",
+    )
+    parser.add_argument("-q", "--quiet", action="store_true", help="hide scan progress")
+    args = parser.parse_args(argv)
+    root = args.root.expanduser().resolve()
+    if not root.is_dir():
+        parser.error(f"Scan root is not a directory: {root}")
+    if not shutil.which("git"):
+        parser.error("Git is required")
+    output = (
+        args.output.expanduser()
+        if args.output
+        else Path.home()
+        / "disk-audits"
+        / datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S-%f")
+    ).resolve()
+    try:
+        # Check the destination before spending minutes walking dependency trees.
+        output.mkdir(parents=True, exist_ok=True)
+        result = Audit(str(root), quiet=args.quiet).run()
+        summary = write_reports(result, output)
+    except KeyboardInterrupt:
+        print("\nAudit cancelled.", file=sys.stderr)
+        return 130
+    except OSError as error:
+        print(f"Audit failed: {error}", file=sys.stderr)
+        return 1
+    print(
+        f"{summary['repo_count']} repositories; {summary['checkout_count']} checkouts; "
+        f"{summary['repo_total_bytes'] / 1024**3:.2f} GiB total; "
+        f"{summary['linked_worktree_bytes'] / 1024**3:.2f} GiB in linked worktrees."
+    )
+    print(f"Reports: {output}")
+    if result["errors"]:
+        print(
+            f"Partial results: {len(result['errors'])} scan errors; see disk-audit.md.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

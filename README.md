@@ -1,5 +1,47 @@
 # Dotfiles
 
+## Repository disk audit
+
+Install the read-only audit command (requires Git and Python 3.9 or newer):
+
+```sh
+install -m 755 code-disk-audit "$HOME/.local/bin/code-disk-audit"
+```
+
+Run it from any directory:
+
+```sh
+code-disk-audit
+code-disk-audit ~/Code/zendesk
+code-disk-audit ~/Code --output ~/disk-audits/after-cleanup
+```
+
+The default scan starts at `~/Code`. It discovers nested repositories, groups
+checkouts by their shared Git directory, and follows all registered worktrees,
+including checkouts outside the scan root. Nested clones inside those worktrees
+are also discovered, along with their own registered worktrees. Existing bare
+repositories and separate shared Git directories are included. Missing registered
+worktrees have no disk usage to measure; they remain visible in the JSON inventory.
+
+Each run writes `disk-audit.html`, `disk-audit.md`, `disk-audit.csv`, and
+`disk-audit.json` to a new directory under `~/disk-audits/TIMESTAMP`, or to the
+explicit `--output` directory. HTML has expandable repository rows showing each
+checkout. Reports are sorted by total size and split into Zendesk and other repos;
+Zendesk means repositories beneath the scan root's `zendesk` directory, or beneath
+an enclosing directory named `zendesk` when scanning only part of that tree.
+Reports include main checkout and linked worktree totals, `node_modules`, shared
+Git metadata, individual checkout sizes, largest directories, and space outside
+repositories. `node_modules` and Git metadata are subsets of the totals.
+
+The scan measures allocated blocks, counts hard-linked files once across the audit,
+and does not follow directory symlinks. Nested repos and checkouts are attributed
+separately to avoid double counting. APFS clone sharing is not visible, so the
+figures are not guaranteed reclaimable space. This is a live scan rather than a
+filesystem snapshot; changing files can affect the totals. A full scan can take
+several minutes. Progress goes to stderr; use `--quiet` to hide it. Files and Git
+refs are only read; reports are the only files written. Scan errors produce
+partial reports and exit status 1; Ctrl-C cancels with status 130.
+
 ## Git cleanup
 
 Install the worktree-aware cleanup script from this directory:
