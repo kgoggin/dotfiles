@@ -1,5 +1,5 @@
 #!/bin/bash
-# Delete merged branches, asking before removing their linked worktrees.
+# Clean up merged branches and idle worktrees, retaining idle branches.
 set -u
 
 # Git locks every stale ref in one transaction when pruning. Case-only names
@@ -70,25 +70,41 @@ if $prune_failed; then
     printf 'Remote ref pruning failed; continuing with local branch and worktree cleanup.\n' >&2
     status=1
 fi
-branches=$(git branch --format='%(refname:lstrip=2)' --merged=HEAD) || exit 1
+# Refresh only main, independently of the invoking worktree's branch. A dry
+# run may download objects, but must not update refs or FETCH_HEAD.
+if $dry_run; then
+    remote_main=$(git ls-remote --exit-code origin refs/heads/main) || exit 1
+    base_tip=${remote_main%%$'\t'*}
+    if ! git cat-file -e "$base_tip^{commit}" 2>/dev/null; then
+        git fetch --no-tags --no-write-fetch-head --refmap= origin "$base_tip" || exit 1
+    fi
+else
+    git fetch --no-tags --no-write-fetch-head origin \
+        '+refs/heads/main:refs/remotes/origin/main' || exit 1
+    base_tip=$(git rev-parse --verify refs/remotes/origin/main) || exit 1
+fi
+printf 'Checking against refreshed origin/main (%s).\n' "${base_tip:0:12}"
+now=$(date +%s) || exit 1
+idle_cutoff=$((now - 7 * 24 * 60 * 60))
 
-# NUL-delimited porcelain preserves spaces, newlines, and quoted path names.
+# NUL-delimited porcelain preserves unusual worktree paths.
 worktree_paths=()
 worktree_branches=()
+worktree_locked=()
 while IFS= read -r -d '' field; do
     case "$field" in
         'worktree '*)
             worktree_paths+=("${field#worktree }")
             worktree_branches+=('')
+            worktree_locked+=(false)
             ;;
         'branch refs/heads/'*)
             worktree_branches[${#worktree_paths[@]}-1]=${field#branch refs/heads/}
             ;;
+        locked|locked\ *) worktree_locked[${#worktree_paths[@]}-1]=true ;;
     esac
 done < <(git worktree list --porcelain -z)
 
-# Squash/rebase merges do not preserve ancestry. Only trust a merged PR when
-# its exact head matches the local branch and its merge commit is in HEAD.
 github_repo=''
 origin_url=$(git config --get remote.origin.url)
 case "$origin_url" in
@@ -97,120 +113,221 @@ case "$origin_url" in
     ssh://git@github.com/*) github_repo=${origin_url#ssh://git@github.com/} ;;
 esac
 github_repo=${github_repo%.git}
-squash_branches=()
-squash_tips=()
-if [[ -n "$github_repo" && -n "$current_branch" && ${#worktree_paths[@]} -gt 1 ]]; then
-    if ! command -v gh >/dev/null 2>&1; then
-        printf 'GitHub CLI unavailable; checking Git ancestry only.\n' >&2
-    elif prs=$(gh pr list --repo "$github_repo" --state merged --base "$current_branch" \
-        --limit 1000 --json headRefName,headRefOid,mergeCommit,number,isCrossRepository \
-        --jq '.[] | select(.isCrossRepository == false) | [.headRefName, .headRefOid, .mergeCommit.oid, .number] | @tsv'); then
-        while IFS=$'\t' read -r branch tip merge_commit pr; do
-            [[ -n "$branch" && -n "$tip" && -n "$merge_commit" ]] || continue
-            linked=false
-            for checked_out in "${worktree_branches[@]}"; do
-                [[ "$checked_out" == "$branch" ]] && linked=true
-            done
-            $linked || continue
-            local_tip=$(git rev-parse --verify "refs/heads/$branch" 2>/dev/null) || continue
-            [[ "$local_tip" == "$tip" ]] || continue
-            git merge-base --is-ancestor "$tip" HEAD 2>/dev/null && continue
-            git merge-base --is-ancestor "$merge_commit" HEAD 2>/dev/null || continue
-            # A branch can have multiple merged PRs; include it only once.
-            duplicate=false
-            for ((j=0; j<${#squash_branches[@]}; j++)); do
-                [[ "${squash_branches[j]}" == "$branch" ]] && duplicate=true
-            done
-            $duplicate && continue
-            squash_branches+=("$branch")
-            squash_tips+=("$tip")
-            branches+=$'\n'"$branch"
-            printf 'Found linked branch %s from merged PR #%s.\n' "$branch" "$pr"
-        done <<< "$prs"
+github_owner=${github_repo%%/*}
+github_available=false
+if [[ -n "$github_repo" ]]; then
+    if command -v gh >/dev/null 2>&1; then
+        github_available=true
     else
-        printf 'Could not check GitHub for squash/rebase merges; checking Git ancestry only.\n' >&2
+        printf 'GitHub CLI unavailable; PR merge checks are unavailable.\n' >&2
     fi
 fi
 
-# Keep branch enumeration on a separate descriptor so prompts read user input.
-while IFS= read -r branch <&3; do
-    case "$branch" in
-        ''|main|develop) continue ;;
-    esac
-    [[ "$branch" == "$current_branch" ]] && continue
+# A private index lets us check the entire branch patch against main without
+# touching any checkout, index, or ref. The files are cleaned up on exit.
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/git-cleanup.XXXXXXXX") || exit 1
+trap 'rm -rf -- "$scratch"' EXIT
+patch_index="$scratch/index"
+patch_present_in_main() {
+    local tip=$1 ancestor
+    ancestor=$(git merge-base "$base_tip" "$tip") || return 1
+    git diff --binary "$ancestor" "$tip" > "$scratch/branch.patch" || return 1
+    [[ -s "$scratch/branch.patch" ]] || return 1
+    GIT_INDEX_FILE="$patch_index" git -c core.splitIndex=false read-tree "$base_tip" || return 1
+    GIT_INDEX_FILE="$patch_index" git -c core.splitIndex=false apply \
+        --cached --reverse --check --whitespace=nowarn "$scratch/branch.patch" 2>/dev/null
+}
 
-    squash_tip=''
-    for ((i=0; i<${#squash_branches[@]}; i++)); do
-        [[ "${squash_branches[i]}" == "$branch" ]] && squash_tip=${squash_tips[i]}
+# Shell aliases invoked in a linked worktree export its GIT_DIR. Clear those
+# repository overrides when inspecting a different worktree's files or HEAD.
+worktree_git() (
+    unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
+    git --no-optional-locks -C "$@"
+)
+
+confirm() {
+    local answer
+    while true; do
+        printf '%s [y/N] ' "$1"
+        answer=''
+        if ! IFS= read -r answer; then
+            printf '\n'
+            return 1
+        fi
+        case "$answer" in
+            y|Y|yes|YES|Yes) return 0 ;;
+            ''|n|N|no|NO|No) return 1 ;;
+            *) printf 'Please answer y or n.\n' ;;
+        esac
     done
+}
 
-    # The first entry is the main worktree; never try to remove it.
-    protected=false
+# Snapshot the branch tips. Recheck each tip before removing its worktree or
+# deleting the branch, including after a user has spent time at a prompt.
+branches=$(git for-each-ref --format='%(refname:strip=2) %(objectname)' refs/heads/) || exit 1
+while IFS=' ' read -r branch tip <&3; do
+    [[ -n "$branch" ]] || continue
+    path=''
+    linked_index=-1
     for ((i=0; i<${#worktree_paths[@]}; i++)); do
-        if [[ "${worktree_branches[i]}" == "$branch" ]] &&
-           { [[ $i == 0 ]] || [[ "${worktree_paths[i]}" == "$current_worktree" ]]; }; then
-            protected=true
+        if [[ "${worktree_branches[i]}" == "$branch" ]]; then
+            path=${worktree_paths[i]}
+            linked_index=$i
+            break
         fi
     done
-    if $protected; then
+    case "$branch" in
+        main|develop)
+            [[ -z "$path" ]] || printf 'Keeping %s: protected branch.\n' "$branch"
+            continue
+            ;;
+    esac
+    if [[ "$branch" == "$current_branch" ]] ||
+       { [[ -n "$path" ]] && { [[ $linked_index == 0 ]] || [[ "$path" == "$current_worktree" ]]; }; }; then
         printf 'Keeping %s: checked out in the main or current worktree.\n' "$branch"
         continue
     fi
 
-    keep=false
-    for ((i=0; i<${#worktree_paths[@]}; i++)); do
-        [[ "${worktree_branches[i]}" == "$branch" ]] || continue
-        path=${worktree_paths[i]}
-        if $dry_run; then
-            printf 'Would remove worktree "%s" and delete merged branch %s.\n' "$path" "$branch"
-            keep=true
+    mode=''
+    reason=''
+    if [[ -n "$path" ]]; then
+        if ! [[ -d "$path" ]]; then
+            printf 'Keeping %s: worktree path is missing; registration needs pruning.\n' "$branch"
             continue
         fi
-        while true; do
-            printf 'Remove worktree "%s" and delete merged branch "%s"? [y/N] ' "$path" "$branch"
-            answer=''
-            if ! IFS= read -r answer; then
-                printf '\n'
-                answer=n
+        if ${worktree_locked[linked_index]}; then
+            printf 'Keeping %s: worktree is locked.\n' "$branch"
+            status=1
+            continue
+        fi
+        contains_worktree=false
+        for child in "${worktree_paths[@]}"; do
+            if [[ "$child" == "$path/"* && -d "$child" ]]; then
+                contains_worktree=true
+                break
             fi
-            case "$answer" in
-                y|Y|yes|YES|Yes)
-                    if [[ -n "$squash_tip" ]] &&
-                       [[ "$(git rev-parse --verify "refs/heads/$branch")" != "$squash_tip" ]]; then
-                        printf 'Keeping %s: branch changed since the merged PR check.\n' "$branch" >&2
-                        keep=true
-                        status=1
-                        break
-                    fi
-                    if ! git worktree remove -- "$path"; then
-                        printf 'Keeping %s: worktree removal failed.\n' "$branch" >&2
-                        keep=true
-                        status=1
-                    fi
-                    break
-                    ;;
-                ''|n|N|no|NO|No)
-                    printf 'Keeping worktree and branch %s.\n' "$branch"
-                    keep=true
-                    break
-                    ;;
-                *) printf 'Please answer y or n.\n' ;;
-            esac
         done
-        $keep && break
-    done
-    $keep && continue
+        if $contains_worktree; then
+            printf 'Keeping %s: contains another registered worktree; clean up children first.\n' "$branch"
+            continue
+        fi
+        commit_time=$(git show -s --format=%ct "$tip") || { status=1; continue; }
+        if [[ $commit_time -le $idle_cutoff ]]; then
+            mode=retain
+            reason="idle: last commit $(((now - commit_time) / 86400)) days ago"
+        fi
+    fi
+    if [[ -z "$mode" ]] && git merge-base --is-ancestor "$tip" "$base_tip"; then
+        mode=delete
+        reason='merged into origin/main by Git ancestry'
+    fi
+
+    # Query all PRs for this branch, with pagination, rather than a repository-
+    # wide window of recent merges. Open PRs can also explain a retained branch.
+    if [[ -z "$mode" && -n "$path" ]]; then
+        reason='branch is not merged into origin/main'
+        if $github_available; then
+            if prs=$(gh api --method GET --paginate "repos/$github_repo/pulls" \
+                -f "head=$github_owner:$branch" -f state=all -f per_page=100 \
+                --jq '.[] | select(.head.repo.full_name == "'"$github_repo"'") | [.head.ref, .head.sha, (.merge_commit_sha // "-"), .number, (if .merged_at != null then "MERGED" else (.state | ascii_upcase) end), .base.ref] | @tsv'); then
+                reason='no matching PR found; branch is not merged into origin/main'
+                open_pr=''
+                closed_pr=''
+                merged_pr=''
+                while IFS=$'\t' read -r pr_branch pr_tip merge_commit pr pr_state pr_base; do
+                    [[ "$pr_branch" == "$branch" ]] || continue
+                    case "$pr_state" in
+                        OPEN) open_pr=$pr; continue ;;
+                        CLOSED) closed_pr=$pr; continue ;;
+                        MERGED) merged_pr=$pr ;;
+                        *) continue ;;
+                    esac
+                    [[ "$pr_base" == main && "$merge_commit" != - ]] || continue
+                    git merge-base --is-ancestor "$merge_commit" "$base_tip" 2>/dev/null || continue
+                    if [[ "$tip" == "$pr_tip" ]]; then
+                        mode=delete
+                        reason="merged PR #$pr (exact branch tip)"
+                        break
+                    elif patch_present_in_main "$tip"; then
+                        mode=retain
+                        reason="review: merged PR #$pr has a different tip; complete branch patch is present in origin/main"
+                        # Prefer an exact match if a reused branch has another PR.
+                    fi
+                done <<< "$prs"
+                if [[ -z "$mode" ]]; then
+                    if [[ -n "$open_pr" ]]; then
+                        reason="open PR #$open_pr; branch is not confirmed merged"
+                    elif [[ -n "$merged_pr" ]]; then
+                        reason="merged PR #$merged_pr, but local changes are not confirmed in origin/main"
+                    elif [[ -n "$closed_pr" ]]; then
+                        reason="PR #$closed_pr was closed without merging"
+                    fi
+                fi
+            else
+                printf 'Could not check GitHub for %s.\n' "$branch" >&2
+                reason='GitHub lookup failed; branch is not confirmed merged'
+            fi
+        elif [[ -n "$github_repo" ]]; then
+            reason='GitHub CLI unavailable; branch is not confirmed merged'
+        fi
+    fi
+    if [[ -z "$mode" ]]; then
+        [[ -z "$path" ]] || printf 'Keeping %s: %s; last commit is less than 7 days old.\n' "$branch" "$reason"
+        continue
+    fi
+
+    if [[ -n "$path" ]]; then
+        dirty=$(worktree_git "$path" status --porcelain --untracked-files=normal) || { status=1; continue; }
+        if [[ -n "$dirty" ]]; then
+            printf 'Keeping %s: worktree has uncommitted or untracked changes (%s).\n' "$branch" "$reason"
+            status=1
+            continue
+        fi
+        printf 'Candidate %s: %s.\n' "$branch" "$reason"
+        if [[ "$mode" == retain ]]; then
+            branch_action=retain
+        else
+            branch_action='delete merged'
+        fi
+        action="remove worktree \"$path\" and $branch_action branch \"$branch\""
+        if $dry_run; then
+            printf 'Would %s.\n' "$action"
+            continue
+        fi
+        if ! confirm "Remove worktree \"$path\" and $branch_action branch \"$branch\"?"; then
+            printf 'Keeping worktree and branch %s.\n' "$branch"
+            continue
+        fi
+        if [[ "$(git rev-parse --verify "refs/heads/$branch")" != "$tip" ]] ||
+           [[ "$(worktree_git "$path" symbolic-ref --quiet HEAD)" != "refs/heads/$branch" ]]; then
+            printf 'Keeping %s: branch changed since the cleanup check.\n' "$branch" >&2
+            status=1
+            continue
+        fi
+        if ! git worktree remove -- "$path"; then
+            printf 'Keeping %s: worktree removal failed.\n' "$branch" >&2
+            status=1
+            continue
+        fi
+        if [[ "$mode" == retain ]]; then
+            printf 'Removed worktree; retained branch %s at %s.\n' "$branch" "${tip:0:12}"
+            continue
+        fi
+    fi
     if $dry_run; then
         printf 'Would delete merged branch %s.\n' "$branch"
-    elif [[ -n "$squash_tip" ]]; then
-        if [[ "$(git rev-parse --verify "refs/heads/$branch")" == "$squash_tip" ]]; then
-            git branch -D -- "$branch" || status=1
-        else
-            printf 'Keeping %s: branch changed since the merged PR check.\n' "$branch" >&2
-            status=1
-        fi
+    elif [[ "$(git rev-parse --verify "refs/heads/$branch")" == "$tip" ]]; then
+        # The frozen main tip or an exact merged PR proves this tip merged.
+        # -d would instead consult the branch upstream or the invoking HEAD.
+        git branch -D -- "$branch" || status=1
     else
-        git branch -d -- "$branch" || status=1
+        printf 'Keeping %s: branch changed since the cleanup check.\n' "$branch" >&2
+        status=1
     fi
 done 3<<< "$branches"
+for ((i=1; i<${#worktree_paths[@]}; i++)); do
+    if [[ -z "${worktree_branches[i]}" ]]; then
+        printf 'Keeping worktree "%s": detached HEAD; no branch to retain.\n' "${worktree_paths[i]}"
+    fi
+done
 exit "$status"
