@@ -42,6 +42,59 @@ several minutes. Progress goes to stderr; use `--quiet` to hide it. Files and Gi
 refs are only read; reports are the only files written. Scan errors produce
 partial reports and exit status 1; Ctrl-C cancels with status 130.
 
+## Disk cleanup
+
+`disk-cleanup` reports what can be reclaimed and runs only the actions you
+name. It uses `git-cleanup` from the same directory for worktrees, so install
+both (Python 3.9 or newer):
+
+```sh
+install -m 755 disk-cleanup git-cleanup "$HOME/.local/bin/"
+install -m 644 git-cleanup-select.py "$HOME/.local/bin/"
+mkdir -p "$HOME/.claude/skills"
+ln -sfn "$PWD/skills/disk-cleanup" "$HOME/.claude/skills/disk-cleanup"
+```
+
+The last command installs the `disk-cleanup` agent skill. With it, an agent
+can produce the report, recommend what to remove, and run the cleanup only for
+IDs you approve.
+
+```sh
+disk-cleanup report                      # every category; takes a few minutes
+disk-cleanup report --only caches,docker # seconds
+disk-cleanup clean wt-2 nm-1             # list what would run
+disk-cleanup clean wt-2 nm-1 --yes       # run it
+```
+
+`report` saves its results to `~/.cache/disk-cleanup/report.json`; `clean`
+accepts IDs from that report for one day. Every option has a risk level:
+`safe` (regenerated on demand), `review` (check the note first), or `info`
+(report only; there is no cleanup action).
+
+- **Caches:** npm and Yarn 1 caches, `pnpm store prune`, and stores from
+  older pnpm versions. It also offers older Playwright, Puppeteer, Cypress, and
+  TypeScript builds, always keeping the newest of each, plus leftover Codex
+  runtime installs that are more than a day old.
+- **Docker:** `docker system prune -a -f`. Volumes are kept. The size estimate
+  needs Docker Desktop running.
+- **Worktrees:** `git cleanup --dry-run --json` runs in each repository under
+  `~/Code` that has linked worktrees, including checkouts registered from
+  `~/.t3/worktrees` and `~/conductor/workspaces`. Each eligible worktree is
+  measured. `clean` applies the approved worktrees with `git cleanup --apply`,
+  which repeats every eligibility and safety check.
+- **Orphaned worktree directories:** directories in `~/.t3/worktrees/*/*` or
+  `~/conductor/workspaces/*/*` that are not registered Git checkouts.
+- **Idle node_modules:** `node_modules` directories within two levels of a
+  checkout root, offered when the checkout's `HEAD` reflog has not changed in 30
+  days. Change the threshold with `--stale-days`.
+- **Report only:** `~/Movies`, protected folders (measured only when the
+  terminal has Full Disk Access), Git metadata larger than 2 GiB, and APFS local
+  snapshots.
+
+Sizes are allocated space; hard links and APFS clones can make actual savings
+smaller. `clean` rechecks orphaned directories and idle `node_modules` before
+removing them, and reports the change in free space afterwards.
+
 ## Git cleanup
 
 Install the worktree-aware cleanup script from this directory:
@@ -127,6 +180,20 @@ branches, or refs:
 ```sh
 git cleanup --dry-run
 ```
+
+Add `--json` to a dry run to print the inventory as JSON on stdout (path,
+branch, tip, mode, and reason for each entry), with progress on stderr. To
+apply pre-approved actions without the checklist, pass a file whose lines are
+`MODE TIP BRANCH`, using the mode and tip from that inventory:
+
+```sh
+git cleanup --apply approved.txt
+```
+
+Cleanup recomputes the inventory first. It skips any approved line whose
+branch tip or mode no longer matches, or whose entry is now kept, and exits
+nonzero. Everything else follows the confirmed-batch path above, including
+rechecking each entry immediately before removal.
 
 A dry run checks the current server main SHA and may download missing Git
 objects. It does not update local refs or `FETCH_HEAD`. Content checks use
