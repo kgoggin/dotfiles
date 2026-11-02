@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import shlex
@@ -674,6 +675,84 @@ class CleanupTest(unittest.TestCase):
         self.assertTrue(first.exists())
         self.assertTrue(second.exists())
 
+    def inventory(self, status=0):
+        result = self.git("cleanup-test", "--dry-run", "--json", check=False)
+        self.assertEqual(result.returncode, status, result.stderr)
+        return json.loads(result.stdout)
+
+    def apply(self, *entries):
+        approved = self.root / "approved"
+        approved.write_text("".join(
+            f"{e['mode']} {e['tip']} {e['branch']}\n" for e in entries))
+        return self.git("cleanup-test", "--apply", str(approved), check=False)
+
+    def entry(self, inventory, branch):
+        return next(e for e in inventory["entries"] if e["branch"] == branch)
+
+    def test_dry_run_json_prints_only_the_inventory_on_stdout(self):
+        path = self.worktree()
+        inventory = self.inventory()
+        self.assertEqual(Path(inventory["repository"]).resolve(), self.repo.resolve())
+        entry = self.entry(inventory, "topic")
+        self.assertEqual(entry["mode"], "delete")
+        self.assertEqual(Path(entry["path"]).resolve(), path.resolve())
+        self.assertEqual(self.entry(inventory, "main")["mode"], "keep")
+        self.assertTrue(path.exists())
+        self.assertTrue(self.has_branch("topic"))
+
+    def test_json_requires_dry_run_and_apply_excludes_dry_run(self):
+        for args in (["--json"], ["--dry-run", "--apply", "x"], ["--apply"]):
+            result = self.git("cleanup-test", *args, check=False)
+            self.assertEqual(result.returncode, 2, args)
+
+    def test_apply_removes_only_approved_actions_without_prompting(self):
+        topic = self.worktree()
+        other = self.worktree("other", "other worktree")
+        result = self.apply(self.entry(self.inventory(), "topic"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(topic.exists())
+        self.assertFalse(self.has_branch("topic"))
+        self.assertTrue(other.exists())
+        self.assertTrue(self.has_branch("other"))
+
+    def test_apply_retains_idle_branch(self):
+        path = self.worktree()
+        tip = self.dated_commit(path, 8)
+        entry = self.entry(self.inventory(), "topic")
+        self.assertEqual(entry["mode"], "retain")
+        result = self.apply(entry)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(path.exists())
+        self.assertEqual(self.git("rev-parse", "topic").stdout.strip(), tip)
+
+    def test_apply_skips_action_whose_branch_moved_after_the_report(self):
+        path = self.worktree()
+        entry = self.entry(self.inventory(), "topic")
+        self.git("commit", "--allow-empty", "-m", "New work", cwd=path)
+        result = self.apply(entry)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no longer eligible", result.stderr)
+        self.assertTrue(path.exists())
+        self.assertTrue(self.has_branch("topic"))
+
+    def test_apply_skips_action_whose_mode_differs(self):
+        path = self.worktree()
+        self.dated_commit(path, 8)
+        entry = dict(self.entry(self.inventory(), "topic"), mode="delete")
+        result = self.apply(entry)
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(path.exists())
+        self.assertTrue(self.has_branch("topic"))
+
+    def test_apply_never_selects_kept_entries(self):
+        path = self.worktree()
+        (path / "scratch.txt").write_text("uncommitted\n")
+        # Dirty checkouts make the dry run fail, but the inventory is still printed.
+        entry = self.entry(self.inventory(status=1), "topic")
+        self.assertEqual(entry["mode"], "keep")
+        result = self.apply(entry)
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue((path / "scratch.txt").exists())
 
 
 if __name__ == "__main__":

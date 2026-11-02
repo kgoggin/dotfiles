@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""Report reclaimable disk space and run explicitly approved cleanup actions."""
+
+import argparse
+import concurrent.futures
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE = HOME / ".cache" / "disk-cleanup" / "report.json"
+MAX_REPORT_AGE = 24 * 60 * 60
+STALE_DAYS = 30
+CATEGORIES = ("caches", "docker", "worktrees", "orphans", "node-modules", "info")
+RISKS = {"safe": "Regenerated on demand", "review": "Check the details first",
+         "info": "Report only; no cleanup action"}
+# Directories that hold agent-managed worktrees, laid out as ROOT/REPO/NAME.
+WORKTREE_ROOTS = (HOME / ".t3" / "worktrees", HOME / "conductor" / "workspaces")
+DOCKER_IMAGE = (HOME / "Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw")
+
+
+def git_env():
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    for name in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        env.pop(name, None)
+    return env
+
+
+def git(path, *args):
+    result = subprocess.run(["git", "-C", str(path), *args], capture_output=True,
+                            text=True, env=git_env(), check=False)
+    return result.stdout if result.returncode == 0 else None
+
+
+def du(path):
+    """Allocated bytes, matching du; hard links count once per path."""
+    result = subprocess.run(["du", "-sk", str(path)], capture_output=True,
+                            text=True, check=False)
+    try:
+        return int(result.stdout.split()[0]) * 1024
+    except (IndexError, ValueError):
+        return 0
+
+
+def sizes(paths):
+    paths = list(paths)
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        return dict(zip(paths, pool.map(du, paths)))
+
+
+def fmt(b):
+    for unit, n in [("TiB", 1024**4), ("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)]:
+        if b >= n:
+            return f"{b / n:,.1f} {unit}"
+    return f"{b:,} B"
+
+
+def short(path):
+    path = str(path)
+    return "~" + path[len(str(HOME)):] if path.startswith(str(HOME) + "/") else path
+
+
+def log(message):
+    print(message, file=sys.stderr, flush=True)
+
+
+def option(category, title, bytes_, risk, action, kind, **params):
+    return {"category": category, "title": title, "bytes": bytes_, "risk": risk,
+            "action": action, "kind": kind, **params}
+
+
+# Caches ---------------------------------------------------------------------
+
+def older_versions(groups):
+    """Every directory except the most recently installed one in each group."""
+    stale = []
+    for group in groups:
+        group = sorted((p for p in group if p.is_dir() and not p.is_symlink()),
+                       key=lambda p: p.stat().st_mtime)
+        stale += group[:-1]
+    return stale
+
+
+def version_caches():
+    caches = HOME / "Library" / "Caches"
+    playwright = caches / "ms-playwright"
+    groups = {}
+    if playwright.is_dir():
+        for child in playwright.iterdir():
+            groups.setdefault(child.name.rsplit("-", 1)[0], []).append(child)
+    puppeteer = HOME / ".cache" / "puppeteer"
+    yield ("playwright-old", "Old Playwright browser builds", list(groups.values()),
+           "re-downloaded by `npx playwright install` if a project still pins one")
+    yield ("puppeteer-old", "Old Puppeteer browser builds",
+           [list(d.iterdir()) for d in puppeteer.iterdir() if d.is_dir()]
+           if puppeteer.is_dir() else [],
+           "re-downloaded on the next install that needs one")
+    for name, label, path in [("cypress-old", "Old Cypress binaries", caches / "Cypress"),
+                              ("typescript-old", "Old TypeScript typings caches",
+                               caches / "typescript")]:
+        yield (name, label, [list(path.iterdir())] if path.is_dir() else [],
+               "re-downloaded on demand")
+
+
+def tool_path(command, *args):
+    if not shutil.which(command):
+        return None
+    result = subprocess.run([command, *args], capture_output=True, text=True,
+                            cwd=HOME, check=False)
+    value = result.stdout.strip().splitlines()
+    return Path(value[-1]) if result.returncode == 0 and value else None
+
+
+def caches():
+    options = []
+    tools = [
+        ("npm-cache", "npm cache", HOME / ".npm" / "_cacache",
+         ["npm", "cache", "clean", "--force"], "safe", ""),
+        ("yarn-cache", "Yarn 1 cache", tool_path("yarn", "cache", "dir"),
+         ["yarn", "cache", "clean"], "safe", ""),
+        ("pnpm-store", "pnpm store", tool_path("pnpm", "store", "path"),
+         ["pnpm", "store", "prune"], "safe",
+         "upper bound: prune frees only packages no project references"),
+    ]
+    for id_, title, path, command, risk, note in tools:
+        if path and path.is_dir() and shutil.which(command[0]):
+            options.append(option("caches", title, du(path), risk,
+                                  " ".join(command), "command", id=id_,
+                                  command=command, path=str(path), note=note))
+    store = next((o["path"] for o in options if o["id"] == "pnpm-store"), None)
+    if store:
+        # Each pnpm major version uses its own store; `store prune` only sees its own.
+        paths = [p for p in Path(store).parent.glob("v*")
+                 if p.is_dir() and p != Path(store)]
+        if paths:
+            options.append(option(
+                "caches", "Stores from older pnpm versions", sum(sizes(paths).values()),
+                "review", "remove " + ", ".join(p.name for p in sorted(paths)),
+                "remove", id="pnpm-old-stores", paths=[str(p) for p in paths],
+                note="existing node_modules keep working; projects pinned to an "
+                     "older pnpm re-download packages on their next install"))
+    for id_, title, groups, note in version_caches():
+        paths = older_versions(groups)
+        if paths:
+            measured = sizes(paths)
+            options.append(option("caches", title, sum(measured.values()), "safe",
+                                  f"remove {len(paths)} older builds; keep the newest",
+                                  "remove", id=id_, paths=[str(p) for p in paths],
+                                  note=note))
+    runtimes = HOME / ".cache" / "codex-runtimes"
+    if runtimes.is_dir():
+        cutoff = time.time() - 24 * 60 * 60
+        paths = [p for p in runtimes.glob("codex-runtime-install-*")
+                 if p.is_dir() and p.stat().st_mtime < cutoff]
+        if paths:
+            options.append(option(
+                "caches", "Leftover Codex runtime installs", sum(sizes(paths).values()),
+                "review", f"remove {len(paths)} install directories older than a day",
+                "remove", id="codex-installs", paths=[str(p) for p in paths],
+                note="leftover temporary install directories; the active "
+                     "codex-primary-runtime is kept"))
+    return options
+
+
+# Docker ---------------------------------------------------------------------
+
+def docker_bytes(text):
+    match = re.match(r"([\d.]+)\s*([kMGT]?B)", text)
+    if not match:
+        return 0
+    scale = {"B": 1, "kB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}[match.group(2)]
+    return int(float(match.group(1)) * scale)
+
+
+def docker():
+    if not DOCKER_IMAGE.exists() or not shutil.which("docker"):
+        return []
+    allocated = DOCKER_IMAGE.stat().st_blocks * 512
+    try:
+        result = subprocess.run(["docker", "system", "df", "--format", "{{json .}}"],
+                                capture_output=True, text=True, check=False, timeout=60)
+        running = result.returncode == 0
+    except subprocess.TimeoutExpired:
+        running = False
+    if not running:
+        return [option("docker", "Docker Desktop disk image", allocated, "info",
+                       "start Docker Desktop, then rerun the report to estimate "
+                       "what a prune would free", "none", id="docker-image",
+                       path=str(DOCKER_IMAGE))]
+    rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    reclaimable = sum(docker_bytes(row.get("Reclaimable", "")) for row in rows)
+    return [option("docker", "Unused Docker images, containers, and build cache",
+                   reclaimable, "review", "docker system prune -a -f (volumes kept)",
+                   "command", id="docker-prune",
+                   command=["docker", "system", "prune", "-a", "-f"],
+                   note=f"disk image currently allocates {fmt(allocated)}; macOS "
+                        "may take a few minutes to release the space")]
+
+
+# Repositories and worktrees -------------------------------------------------
+
+def worktree_list(path):
+    raw = git(path, "worktree", "list", "--porcelain", "-z")
+    if raw is None:
+        return []
+    return [os.path.realpath(field[9:]) for field in raw.split("\0")
+            if field.startswith("worktree ")]
+
+
+def discover_repositories(root, depth=4):
+    """Map each shared Git directory to its registered checkouts."""
+    repos = {}
+    root = Path(root)
+    for current, dirs, files in os.walk(root):
+        level = len(Path(current).relative_to(root).parts)
+        if ".git" in dirs or ".git" in files:
+            common = git(current, "rev-parse", "--path-format=absolute",
+                         "--git-common-dir")
+            common = common and os.path.realpath(common.strip())
+            if common and common not in repos:
+                repos[common] = worktree_list(current)
+        dirs[:] = [] if level >= depth else sorted(
+            d for d in dirs if d != "node_modules" and not d.startswith("."))
+    return repos
+
+
+def git_cleanup_command():
+    local = Path(__file__).resolve().with_name("git-cleanup")
+    if os.access(local, os.X_OK):
+        return str(local)
+    return shutil.which("git-cleanup")
+
+
+def cleanup_inventory(repository):
+    result = subprocess.run([git_cleanup_command(), "--dry-run", "--json"],
+                            cwd=repository, capture_output=True, text=True,
+                            env=git_env(), check=False, stdin=subprocess.DEVNULL)
+    try:
+        return json.loads(result.stdout), None
+    except json.JSONDecodeError:
+        lines = result.stderr.strip().splitlines()
+        errors = [l for l in lines if l.startswith(("fatal:", "error:"))]
+        return None, (errors or lines or ["no inventory"])[0]
+
+
+def worktrees(repos, warnings):
+    if not git_cleanup_command():
+        warnings.append("git-cleanup not found; worktrees were not checked")
+        return []
+    candidates = [checkouts[0] for checkouts in repos.values() if len(checkouts) > 1
+                  and os.path.isdir(checkouts[0])]
+    log(f"Checking {len(candidates)} repositories with linked worktrees...")
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        inventories = dict(zip(candidates, pool.map(cleanup_inventory, candidates)))
+    entries = []
+    for repository, (inventory, error) in inventories.items():
+        if inventory is None:
+            warnings.append(f"git cleanup failed in {short(repository)}: {error}")
+            continue
+        for entry in inventory["entries"]:
+            if entry["path"] and entry["mode"] in ("retain", "delete") and \
+                    os.path.isdir(entry["path"]):
+                entries.append((repository, entry))
+    measured = sizes(entry["path"] for _, entry in entries)
+    options = []
+    for repository, entry in entries:
+        branch = ("retain branch" if entry["mode"] == "retain"
+                  else "delete merged branch")
+        options.append(option(
+            "worktrees", f"{Path(repository).name}: {entry['branch']}",
+            measured[entry["path"]], "review", f"remove worktree; {branch}",
+            "worktree", repository=repository, path=entry["path"],
+            branch=entry["branch"], tip=entry["tip"], mode=entry["mode"],
+            note=entry["reason"]))
+    return options
+
+
+def is_orphan(path, registered):
+    path = os.path.realpath(path)
+    if path in registered:
+        return False
+    common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return common is None or path not in worktree_list(path)
+
+
+def orphan_candidates(registered):
+    for root in WORKTREE_ROOTS:
+        if root.is_dir():
+            for path in sorted(root.glob("*/*")):
+                if path.is_dir() and not path.is_symlink() and is_orphan(path, registered):
+                    yield path
+
+
+def orphans(registered):
+    paths = list(orphan_candidates(registered))
+    measured = sizes(paths)
+    return [option("orphans", f"Orphaned worktree directory {short(p)}", measured[p],
+                   "review", "remove directory", "orphan", path=str(p),
+                   note="not a registered Git checkout; files here cannot be "
+                        "recovered from Git")
+            for p in paths]
+
+
+def last_activity(checkout):
+    """Most recent checkout, commit, pull, or reset, from the HEAD reflog."""
+    reflog = git(checkout, "rev-parse", "--path-format=absolute", "--git-path",
+                 "logs/HEAD")
+    try:
+        return os.stat(reflog.strip()).st_mtime
+    except (AttributeError, OSError):
+        return None
+
+
+def stale_dependencies(checkout, days):
+    activity = last_activity(checkout)
+    if activity is None or activity > time.time() - days * 86400:
+        return []
+    found = []
+    for current, dirs, _ in os.walk(checkout):
+        if "node_modules" in dirs:
+            found.append(Path(current) / "node_modules")
+        level = len(Path(current).relative_to(checkout).parts)
+        dirs[:] = [] if level >= 2 else [
+            d for d in dirs if d != "node_modules" and not d.startswith(".")]
+    return found
+
+
+def node_modules(repos, skip, days):
+    checkouts = [c for checkouts in repos.values() for c in checkouts
+                 if c not in skip and os.path.isdir(c)]
+    options = []
+    for checkout in checkouts:
+        paths = stale_dependencies(checkout, days)
+        if not paths:
+            continue
+        idle = int((time.time() - last_activity(checkout)) / 86400)
+        options.append(option(
+            "node-modules", f"node_modules in {short(checkout)}",
+            sum(sizes(paths).values()), "safe",
+            f"remove {len(paths)} node_modules director{'y' if len(paths) == 1 else 'ies'}",
+            "node-modules", checkout=checkout, paths=[str(p) for p in paths], days=days,
+            note=f"no Git activity for {idle} days; reinstall to use it again"))
+    return options
+
+
+# Report-only items ----------------------------------------------------------
+
+def info(repos):
+    options = []
+    for name in ("Movies", "Downloads", "Desktop", "Documents"):
+        path = HOME / name
+        try:
+            os.listdir(path)
+        except PermissionError:
+            options.append(option("info", f"~/{name}", 0, "info",
+                                  "not readable; grant your terminal Full Disk Access "
+                                  "to measure it", "none", path=str(path)))
+            continue
+        except OSError:
+            continue
+        options.append(option("info", f"~/{name}", du(path), "info",
+                              "personal files; review by hand", "none", path=str(path)))
+    measured = sizes(repos)
+    for common, bytes_ in measured.items():
+        if bytes_ >= 2 * 1024**3:
+            options.append(option("info", f"Git metadata {short(common)}", bytes_, "info",
+                                  "consider `git maintenance run --task=gc` in "
+                                  + short(Path(common).parent), "none", path=common))
+    result = subprocess.run(["tmutil", "listlocalsnapshots", "/"], capture_output=True,
+                            text=True, check=False)
+    count = sum("com.apple" in line for line in result.stdout.splitlines())
+    if count:
+        options.append(option("info", f"{count} APFS local snapshots", 0, "info",
+                              "Time Machine snapshots can hold deleted files; "
+                              "`tmutil listlocalsnapshots /`", "none"))
+    return options
+
+
+# Commands -------------------------------------------------------------------
+
+def build_report(args):
+    warnings = []
+    options = []
+    wanted = set(args.categories)
+    if "caches" in wanted:
+        log("Measuring caches...")
+        options += caches()
+    if "docker" in wanted:
+        log("Checking Docker...")
+        options += docker()
+    repos = {}
+    if wanted & {"worktrees", "orphans", "node-modules", "info"}:
+        log(f"Finding repositories in {short(args.code_root)}...")
+        repos = discover_repositories(args.code_root)
+    removable = []
+    if "worktrees" in wanted:
+        removable = worktrees(repos, warnings)
+        options += removable
+    registered = {c for checkouts in repos.values() for c in checkouts}
+    if "orphans" in wanted:
+        log("Looking for orphaned worktree directories...")
+        options += orphans(registered)
+    if "node-modules" in wanted:
+        log(f"Looking for node_modules idle for {args.stale_days}+ days...")
+        options += node_modules(repos, {os.path.realpath(o["path"]) for o in removable},
+                                args.stale_days)
+    if "info" in wanted:
+        log("Measuring report-only items...")
+        options += info(repos)
+    options = [o for o in options if o["bytes"] or o["risk"] == "info"]
+    order = {category: i for i, category in enumerate(CATEGORIES)}
+    options.sort(key=lambda o: (order[o["category"]], o["risk"] == "info", -o["bytes"]))
+    counters = {}
+    prefixes = {"worktrees": "wt", "orphans": "orphan", "node-modules": "nm",
+                "info": "info"}
+    for item in options:
+        if "id" not in item:
+            prefix = prefixes.get(item["category"], item["category"])
+            counters[prefix] = counters.get(prefix, 0) + 1
+            item["id"] = f"{prefix}-{counters[prefix]}"
+    usage = shutil.disk_usage(HOME)
+    return {"created": time.time(),
+            "created_text": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "disk": {"total": usage.total, "free": usage.free},
+            "options": options, "warnings": warnings}
+
+
+def print_report(report):
+    disk = report["disk"]
+    print(f"Free space: {fmt(disk['free'])} of {fmt(disk['total'])} "
+          f"({100 - disk['free'] * 100 // disk['total']}% used)\n")
+    titles = {"caches": "Caches", "docker": "Docker",
+              "worktrees": "Worktrees (git cleanup rules)",
+              "orphans": "Orphaned worktree directories",
+              "node-modules": "Idle node_modules", "info": "Report only"}
+    for category in CATEGORIES:
+        rows = [o for o in report["options"] if o["category"] == category]
+        if not rows:
+            continue
+        print(titles[category])
+        for o in rows:
+            size = fmt(o["bytes"]) if o["bytes"] else "—"
+            print(f"  {o['id']:<16} {size:>10}  {o['risk']:<6}  {o['title']}")
+            print(f"  {'':<16} {'':>10}  {'':<6}  {o['action']}")
+            if o.get("note"):
+                print(f"  {'':<16} {'':>10}  {'':<6}  {o['note']}")
+        print()
+    for warning in report["warnings"]:
+        print("Warning: " + warning)
+    actionable = [o for o in report["options"] if o["risk"] != "info"]
+    safe = sum(o["bytes"] for o in actionable if o["risk"] == "safe")
+    print(f"Actionable: {fmt(sum(o['bytes'] for o in actionable))} "
+          f"({fmt(safe)} marked safe). Sizes are allocated space; shared or "
+          "hard-linked files can make actual savings smaller.")
+    print("Clean up with: disk-cleanup clean ID... --yes")
+
+
+def load_state(path):
+    try:
+        report = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError):
+        raise SystemExit("No saved report; run `disk-cleanup report` first.")
+    if time.time() - report["created"] > MAX_REPORT_AGE:
+        raise SystemExit("The saved report is over a day old; run "
+                         "`disk-cleanup report` again.")
+    return report
+
+
+def remove(path):
+    path = Path(path)
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def run_worktrees(items):
+    by_repo = {}
+    for item in items:
+        by_repo.setdefault(item["repository"], []).append(item)
+    ok = True
+    for repository, selected in by_repo.items():
+        print(f"\n== git cleanup in {short(repository)}", flush=True)
+        with tempfile.NamedTemporaryFile("w", suffix=".approved", delete=False) as f:
+            f.writelines(f"{i['mode']} {i['tip']} {i['branch']}\n" for i in selected)
+        try:
+            result = subprocess.run([git_cleanup_command(), "--apply", f.name],
+                                    cwd=repository, env=git_env(), check=False,
+                                    stdin=subprocess.DEVNULL)
+        finally:
+            os.unlink(f.name)
+        ok = ok and result.returncode == 0
+    return ok
+
+
+def run_item(item, registered):
+    kind = item["kind"]
+    if kind == "command":
+        print(f"$ {' '.join(item['command'])}", flush=True)
+        return subprocess.run(item["command"], cwd=HOME, check=False,
+                              stdin=subprocess.DEVNULL).returncode == 0
+    if kind == "orphan":
+        # Recheck: a directory may have been registered since the report.
+        if not is_orphan(item["path"], registered()):
+            print(f"Skipping {short(item['path'])}: it is now a registered checkout.")
+            return False
+        remove(item["path"])
+    elif kind == "node-modules":
+        if not stale_dependencies(item["checkout"], item["days"]):
+            print(f"Skipping {short(item['checkout'])}: it has recent Git activity.")
+            return False
+        for path in item["paths"]:
+            remove(path)
+    elif kind == "remove":
+        for path in item["paths"]:
+            remove(path)
+    else:
+        print(f"{item['id']} has no cleanup action.")
+        return False
+    print(f"Removed {item['title']}.")
+    return True
+
+
+def clean(args):
+    report = load_state(args.state)
+    by_id = {o["id"]: o for o in report["options"]}
+    unknown = [i for i in args.ids if i not in by_id]
+    if unknown:
+        raise SystemExit("Unknown IDs: " + ", ".join(unknown))
+    items = [by_id[i] for i in dict.fromkeys(args.ids)]
+    report_only = [i["id"] for i in items if i["risk"] == "info"]
+    if report_only:
+        raise SystemExit("Report-only items have no cleanup action: "
+                         + ", ".join(report_only))
+    print(f"Approved actions (report from {report['created_text']}):")
+    for item in items:
+        print(f"  {item['id']:<16} {fmt(item['bytes']):>10}  {item['title']}: "
+              f"{item['action']}")
+    if not args.yes:
+        print("\nNothing changed. Add --yes to run these actions.")
+        return 0
+    before = shutil.disk_usage(HOME).free
+    ok = True
+    cache = {}
+
+    def registered():
+        # Orphan rechecks need a fresh view of registered checkouts.
+        if "value" not in cache:
+            repos = discover_repositories(args.code_root)
+            cache["value"] = {c for checkouts in repos.values() for c in checkouts}
+        return cache["value"]
+
+    for item in items:
+        if item["kind"] != "worktree":
+            print(f"\n== {item['id']}", flush=True)
+            try:
+                ok = run_item(item, registered) and ok
+            except OSError as error:
+                print(f"Failed: {error}", file=sys.stderr)
+                ok = False
+    worktree_items = [i for i in items if i["kind"] == "worktree"]
+    if worktree_items:
+        ok = run_worktrees(worktree_items) and ok
+    freed = shutil.disk_usage(HOME).free - before
+    print(f"\nFree space changed by {fmt(abs(freed))}"
+          f"{'' if freed >= 0 else ' (decreased)'}; now {fmt(shutil.disk_usage(HOME).free)}.")
+    print("Run `disk-cleanup report` again before choosing more actions.")
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state", type=Path, default=STATE, help=argparse.SUPPRESS)
+    parser.add_argument("--code-root", type=Path, default=HOME / "Code",
+                        help="where repositories live (default: ~/Code)")
+    commands = parser.add_subparsers(dest="command", required=True)
+    report = commands.add_parser("report", help="measure cleanup options (read-only)")
+    report.add_argument("--json", action="store_true", help="print JSON")
+    report.add_argument("--only", dest="categories", type=lambda s: s.split(","),
+                        default=list(CATEGORIES),
+                        help="comma-separated categories: " + ",".join(CATEGORIES))
+    report.add_argument("--stale-days", type=int, default=STALE_DAYS,
+                        help=f"idle days before node_modules are offered (default {STALE_DAYS})")
+    cleanup = commands.add_parser("clean", help="run approved actions from the last report")
+    cleanup.add_argument("ids", nargs="+", metavar="ID")
+    cleanup.add_argument("--yes", action="store_true",
+                         help="actually run the actions (otherwise only list them)")
+    args = parser.parse_args(argv)
+    args.code_root = args.code_root.expanduser().resolve()
+    try:
+        if args.command == "clean":
+            return clean(args)
+        unknown = set(args.categories) - set(CATEGORIES)
+        if unknown:
+            parser.error("Unknown categories: " + ", ".join(sorted(unknown)))
+        result = build_report(args)
+        args.state.parent.mkdir(parents=True, exist_ok=True)
+        args.state.write_text(json.dumps(result, indent=2) + "\n")
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print_report(result)
+        return 0
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

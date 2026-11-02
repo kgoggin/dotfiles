@@ -43,14 +43,36 @@ prune_case_collisions() {
     done <<< "$collisions"
 }
 
+usage() {
+    printf 'Usage: git cleanup [--dry-run [--json] | --apply FILE]\n' >&2
+    exit 2
+}
 dry_run=false
-case "${1-}" in
-    --dry-run) dry_run=true ;;
-    '') ;;
-    *) printf 'Usage: git cleanup [--dry-run]\n' >&2; exit 2 ;;
-esac
+json=false
+apply_file=''
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) dry_run=true ;;
+        --json) json=true ;;
+        --apply) [[ $# -gt 1 ]] || usage; apply_file=$2; shift ;;
+        *) usage ;;
+    esac
+    shift
+done
+if { $json && ! $dry_run; } || { $dry_run && [[ -n "$apply_file" ]]; }; then
+    usage
+fi
+if [[ -n "$apply_file" && ! -r "$apply_file" ]]; then
+    printf 'Cannot read approved actions: %s\n' "$apply_file" >&2
+    exit 2
+fi
+if $json; then
+    command -v python3 >/dev/null 2>&1 || { printf 'git cleanup --json requires Python 3.\n' >&2; exit 1; }
+    # Keep stdout for the JSON inventory; progress and Git output go to stderr.
+    exec 4>&1 1>&2
+fi
 
-if ! $dry_run; then
+if ! $dry_run && [[ -z "$apply_file" ]]; then
     command -v python3 >/dev/null 2>&1 || { printf 'git cleanup requires Python 3 for its checklist.\n' >&2; exit 1; }
     selector="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/git-cleanup-select.py"
     [[ -r "$selector" ]] || { printf 'Missing checklist helper: %s\n' "$selector" >&2; exit 1; }
@@ -326,38 +348,77 @@ for ((i=0; i<${#worktree_paths[@]}; i++)); do
         record_entry keep "$reason"
     fi
 done
-$dry_run && exit "$status"
-
-# The selector writes numeric inventory IDs only after one final confirmation.
-# Its NUL-separated input preserves spaces, quotes, and newlines in paths.
+# The NUL-separated inventory preserves spaces, quotes, and newlines in paths.
 for ((i=0; i<${#entry_paths[@]}; i++)); do
     printf '%s\0' "${entry_paths[i]}" "${entry_branches[i]}" \
         "${entry_tips[i]}" "${entry_modes[i]}" "${entry_reasons[i]}"
 done > "$scratch/inventory"
-if python3 "$selector" "$scratch/inventory" "$scratch/selected"; then
-    :
-else
-    selector_status=$?
-    if [[ $selector_status == 130 ]]; then
-        printf 'Cleanup cancelled; no worktrees or branches removed.\n'
-        exit "$status"
-    fi
-    exit 1
+if $json; then
+    python3 - "$scratch/inventory" "${worktree_paths[0]}" "$base_tip" "$status" >&4 <<'PY' || exit 1
+import json, os, sys
+fields = open(sys.argv[1], 'rb').read().split(b'\0')[:-1]
+keys = ('path', 'branch', 'tip', 'mode', 'reason')
+entries = [dict(zip(keys, (os.fsdecode(f) for f in fields[i:i + 5])))
+           for i in range(0, len(fields), 5)]
+print(json.dumps({'repository': sys.argv[2], 'origin_main': sys.argv[3],
+                  'status': int(sys.argv[4]), 'entries': entries}, indent=2))
+PY
 fi
+$dry_run && exit "$status"
+
 selected=()
 selected_flags=()
-while IFS= read -r row; do
-    case "$row" in
-        ''|*[!0-9]*) printf 'Invalid cleanup selection.\n' >&2; exit 1 ;;
-    esac
-    if [[ ${#row} -gt 6 ]] || [[ $row -ge ${#entry_paths[@]} ]] ||
-       [[ "${entry_modes[row]}" == keep || -n "${selected_flags[row]-}" ]]; then
-        printf 'Invalid cleanup selection.\n' >&2
+if [[ -n "$apply_file" ]]; then
+    # Pre-approved actions name the mode, tip, and branch reported by a dry run.
+    # Anything whose decision or tip has changed since then is skipped.
+    while IFS=' ' read -r want_mode want_tip want_branch; do
+        [[ -n "$want_mode$want_tip$want_branch" ]] || continue
+        match=''
+        for ((i=0; i<${#entry_paths[@]}; i++)); do
+            if [[ "${entry_branches[i]}" == "$want_branch" && "${entry_tips[i]}" == "$want_tip" &&
+                  "${entry_modes[i]}" == "$want_mode" && "$want_mode" != keep ]]; then
+                match=$i
+                break
+            fi
+        done
+        if [[ -z "$match" ]]; then
+            printf 'Skipping approved %s action for %s: it is no longer eligible.\n' \
+                "$want_mode" "$want_branch" >&2
+            status=1
+        elif [[ -z "${selected_flags[match]-}" ]]; then
+            selected_flags[match]=true
+            selected+=("$match")
+        fi
+    done < "$apply_file"
+    if [[ ${#selected[@]} == 0 ]]; then
+        printf 'No approved actions remain eligible; nothing removed.\n'
+        exit "$status"
+    fi
+else
+    # The selector writes numeric inventory IDs only after one final confirmation.
+    if python3 "$selector" "$scratch/inventory" "$scratch/selected"; then
+        :
+    else
+        selector_status=$?
+        if [[ $selector_status == 130 ]]; then
+            printf 'Cleanup cancelled; no worktrees or branches removed.\n'
+            exit "$status"
+        fi
         exit 1
     fi
-    selected_flags[row]=true
-    selected+=("$row")
-done < "$scratch/selected"
+    while IFS= read -r row; do
+        case "$row" in
+            ''|*[!0-9]*) printf 'Invalid cleanup selection.\n' >&2; exit 1 ;;
+        esac
+        if [[ ${#row} -gt 6 ]] || [[ $row -ge ${#entry_paths[@]} ]] ||
+           [[ "${entry_modes[row]}" == keep || -n "${selected_flags[row]-}" ]]; then
+            printf 'Invalid cleanup selection.\n' >&2
+            exit 1
+        fi
+        selected_flags[row]=true
+        selected+=("$row")
+    done < "$scratch/selected"
+fi
 
 # Recheck nesting as well as commit and checkout identity: another process may
 # have created a child worktree while the checklist was open.
