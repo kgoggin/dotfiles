@@ -1,0 +1,5 @@
+// Personal profile: mcp-sync mcp/personal.jsonc
+{
+  "extends": "common.jsonc",
+  "mcpServers": {},
+}

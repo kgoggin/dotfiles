@@ -1,0 +1,27 @@
+// Work profile: mcp-sync mcp/work.jsonc
+{
+  "extends": "common.jsonc",
+  "mcpServers": {
+    // Zendesk MCP gateway (auth is handled by the gateway via OAuth)
+    "fetch": {
+      "type": "http",
+      "url": "https://mcp-gateway.zende.sk/mcps/fetch"
+    },
+    "researcher": {
+      "type": "http",
+      "url": "https://mcp-gateway.zende.sk/mcps/researcher"
+    },
+    "unleash": {
+      "type": "http",
+      "url": "https://mcp-gateway.zende.sk/mcps/unleash"
+    },
+    "zendesk-graphql": {
+      "type": "http",
+      "url": "https://mcp-gateway.zende.sk/mcps/zendesk-graphql"
+    },
+    "kody": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    },
+  },
+}
