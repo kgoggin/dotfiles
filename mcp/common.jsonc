@@ -1,0 +1,26 @@
+// Servers shared by every profile. work.jsonc and personal.jsonc extend this file.
+//
+// Format: JSON with comments and trailing commas. Each entry uses Claude Code's
+// .mcp.json shape, plus three optional keys:
+//   "harnesses": ["claude"] | ["codex"]   limit a server to one harness
+//   "claude": { ... }                     keys merged over the Claude entry
+//   "codex":  { ... }                     keys merged over the Codex entry (snake_case TOML keys)
+//
+// Secrets: never write a value here. Reference an environment variable as "${NAME}"
+// and export it from your shell. "${HOME}" is the one exception: it is expanded
+// when mcp-sync runs, so paths work on any machine.
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": [
+        "chrome-devtools-mcp@latest",
+        "--autoConnect"
+      ],
+    },
+    "kitt": {
+      "type": "http",
+      "url": "https://family-kitt.fly.dev/mcp"
+    }
+  },
+}

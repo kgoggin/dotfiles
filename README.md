@@ -1,5 +1,61 @@
 # Dotfiles
 
+## MCP server sync
+
+`mcp-sync.mts` builds the MCP server lists for Claude Code, Codex and opencode from one
+base file, so all three stay in step. It is TypeScript that Node runs
+directly (Node 22.18 or newer, no dependencies, no build step), and nothing
+needs installing; run it from this repo. A bare profile name means
+`mcp/<name>.jsonc` here, so it works from any directory:
+
+```sh
+./mcp-sync.mts work --dry-run         # show what would change
+./mcp-sync.mts work                   # apply
+./mcp-sync.mts personal               # switch profile
+./mcp-sync.mts work --harness codex,opencode
+./mcp-sync.mts ~/some/other.jsonc     # any path also works
+```
+
+`work.jsonc` and `personal.jsonc` both `"extends": "common.jsonc"`. Files are
+JSON with comments and trailing commas. Each server uses Claude Code's
+`.mcp.json` shape, plus optional keys:
+
+- `"harnesses": ["codex"]` limits a server to the listed harnesses.
+- `"claude": {...}`, `"codex": {...}` and `"opencode": {...}` merge extra keys
+  into that harness's entry. Codex keys are snake_case TOML names such as
+  `enabled_tools` or `startup_timeout_sec`; opencode keys are things like
+  `disabled` or `timeout`.
+- Setting a server to `null` in a child file removes one it inherits.
+
+**Secrets never go in these files.** Write `"${NAME}"` and export `NAME` from
+your shell; `mcp-sync` rejects literal values for keys, tokens, and
+`Authorization` headers. opencode interpolates too, so `${NAME}` becomes
+`{env:NAME}`, and remote servers with an `Authorization` header get
+`oauth: false`. For Codex, which does not interpolate, a reference
+becomes `env_vars`, `bearer_token_env_var`, or `env_http_headers`. Codex can
+only forward a variable under its own name. `${HOME}` is the one exception:
+it is expanded when `mcp-sync` runs.
+
+What gets written:
+
+- `~/.claude.json`: only the `mcpServers` key (user scope). Project-scoped
+  servers and everything else are untouched.
+- `~/.codex/config.toml`: one block between `# BEGIN mcp-sync` and
+  `# END mcp-sync`. Servers outside it, such as app-provided `node_repl`, are
+  left alone. The BEGIN line records the names `mcp-sync` wrote; a table an app
+  inserts inside the block is moved out, never deleted.
+- `~/.config/opencode/opencode.json` (or `.jsonc` if that is what you have):
+  only `mcp.servers`, the opencode 2.x shape. Other keys, `mcp.timeout`, and
+  deprecated flat `mcp.<name>` entries are left alone. Comments in the file
+  do not survive a rewrite (the `.bak` copy keeps them).
+- Originals are copied to `*.mcp-sync.bak`. Managed server names for Claude and opencode are
+  recorded in `~/.local/state/mcp-sync/state.json`, so switching profiles removes
+  the old profile's servers but never ones you added by hand.
+
+A server that already exists outside `mcp-sync` is never overwritten silently;
+the run stops and asks for `--adopt`. Run the tests with
+`node --test tests/mcp-sync.test.mts`.
+
 ## Repository disk audit
 
 Install the read-only audit command (requires Git and Python 3.9 or newer):
